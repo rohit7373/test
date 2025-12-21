@@ -22,10 +22,10 @@ app.add_middleware(
 # ----------------------------
 @app.get("/")
 def root():
-    return {"status": "Binance Spot Testnet Bot Running"}
+    return {"status": "Binance SPOT Testnet Bot Running"}
 
 # ----------------------------
-# Helper: Adjust Quantity to LOT_SIZE
+# Helper: LOT_SIZE handling
 # ----------------------------
 def adjust_quantity(client: Client, symbol: str, raw_qty: float):
     info = client.get_symbol_info(symbol)
@@ -34,7 +34,6 @@ def adjust_quantity(client: Client, symbol: str, raw_qty: float):
     step_size = float(lot_filter["stepSize"])
     min_qty = float(lot_filter["minQty"])
 
-    # Floor to step size
     precision = int(round(-math.log(step_size, 10), 0))
     qty = math.floor(raw_qty / step_size) * step_size
     qty = round(qty, precision)
@@ -45,19 +44,21 @@ def adjust_quantity(client: Client, symbol: str, raw_qty: float):
     return qty, None
 
 # ----------------------------
-# Webhook Endpoint
+# Webhook (SPOT)
 # ----------------------------
 @app.post("/webhook")
 async def webhook(req: Request):
     try:
         data = await req.json()
 
-        symbol = data.get("symbol", "BTCUSDT")
         action = data.get("action", "BUY").upper()
-        position_pct = float(data.get("position_size", 1))
+        symbol = data.get("symbol", "BTCUSDT")
+        position_pct = float(data.get("position_size", 10))
+        tp_pct = float(data.get("tp_pct", 0))
+        sl_pct = float(data.get("sl_pct", 0))
 
         # ----------------------------
-        # Binance Client (INSIDE request)
+        # Binance Spot Testnet Client
         # ----------------------------
         client = Client(
             os.getenv("BINANCE_API_KEY"),
@@ -67,65 +68,98 @@ async def webhook(req: Request):
         client.API_URL = "https://testnet.binance.vision/api"
 
         # ----------------------------
-        # Get USDT Balance
+        # BUY LOGIC
         # ----------------------------
-        account = client.get_account()
-        balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
+        if action == "BUY":
+            account = client.get_account()
+            balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
 
-        if "USDT" not in balances or balances["USDT"] <= 0:
+            if "USDT" not in balances or balances["USDT"] <= 0:
+                return {"status": "error", "message": "No USDT balance"}
+
+            usdt_balance = balances["USDT"]
+            price = float(client.get_symbol_ticker(symbol=symbol)["price"])
+
+            raw_qty = (usdt_balance * position_pct / 100) / price
+            qty, err = adjust_quantity(client, symbol, raw_qty)
+            if err:
+                return {"status": "error", "message": err}
+
+            buy_order = client.create_order(
+                symbol=symbol,
+                side=Client.SIDE_BUY,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+
+            # Optional TP / SL
+            if tp_pct > 0:
+                tp_price = round(price * (1 + tp_pct / 100), 2)
+                client.create_order(
+                    symbol=symbol,
+                    side=Client.SIDE_SELL,
+                    type=Client.ORDER_TYPE_LIMIT,
+                    quantity=qty,
+                    price=str(tp_price),
+                    timeInForce=Client.TIME_IN_FORCE_GTC
+                )
+
+            if sl_pct > 0:
+                sl_price = round(price * (1 - sl_pct / 100), 2)
+                client.create_order(
+                    symbol=symbol,
+                    side=Client.SIDE_SELL,
+                    type=Client.ORDER_TYPE_STOP_LOSS_LIMIT,
+                    quantity=qty,
+                    stopPrice=str(sl_price),
+                    price=str(sl_price),
+                    timeInForce=Client.TIME_IN_FORCE_GTC
+                )
+
             return {
-                "status": "error",
-                "message": "No USDT balance available in Spot Testnet wallet"
+                "status": "success",
+                "action": "BUY",
+                "symbol": symbol,
+                "quantity": qty,
+                "price": price
             }
 
-        usdt_balance = balances["USDT"]
+        # ----------------------------
+        # SELL LOGIC
+        # ----------------------------
+        elif action == "SELL":
+            asset = symbol.replace("USDT", "")
+            account = client.get_account()
+            balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
 
-        # ----------------------------
-        # Get Price
-        # ----------------------------
-        price = float(client.get_symbol_ticker(symbol=symbol)["price"])
+            if asset not in balances or balances[asset] <= 0:
+                return {"status": "error", "message": f"No {asset} balance"}
 
-        # ----------------------------
-        # Calculate Raw Quantity
-        # ----------------------------
-        raw_qty = (usdt_balance * position_pct / 100) / price
+            qty = balances[asset] * position_pct / 100
 
-        qty, error = adjust_quantity(client, symbol, raw_qty)
-        if error:
+            qty, err = adjust_quantity(client, symbol, qty)
+            if err:
+                return {"status": "error", "message": err}
+
+            sell_order = client.create_order(
+                symbol=symbol,
+                side=Client.SIDE_SELL,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+
             return {
-                "status": "error",
-                "message": error
+                "status": "success",
+                "action": "SELL",
+                "symbol": symbol,
+                "quantity": qty
             }
 
-        # ----------------------------
-        # Place Order
-        # ----------------------------
-        side = Client.SIDE_BUY if action == "BUY" else Client.SIDE_SELL
-
-        order = client.create_order(
-            symbol=symbol,
-            side=side,
-            type=Client.ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-
-        return {
-            "status": "success",
-            "symbol": symbol,
-            "action": action,
-            "quantity": qty,
-            "price": price,
-            "order_id": order.get("orderId")
-        }
+        else:
+            return {"status": "error", "message": "Invalid action"}
 
     except BinanceAPIException as e:
-        return {
-            "status": "error",
-            "message": f"Binance API error: {e.message}"
-        }
+        return {"status": "error", "message": f"Binance API error: {e.message}"}
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Server error: {str(e)}"
-        }
+        return {"status": "error", "message": f"Server error: {str(e)}"}
