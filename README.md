@@ -1,2 +1,1 @@
-# test
-test-binance
+Binance Spot Testnet Backend
