@@ -1,165 +1,75 @@
+
+import os, math
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
-import os
-import math
+from datetime import datetime
 
-# ----------------------------
-# FastAPI App
-# ----------------------------
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+client = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_SECRET_KEY"), testnet=True)
+client.API_URL = "https://testnet.binance.vision/api"
 
-# ----------------------------
-# Health Check
-# ----------------------------
-@app.get("/")
-def root():
-    return {"status": "Binance SPOT Testnet Bot Running"}
+TF_MAP = {
+ "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","2h":"2h","4h":"4h"
+}
 
-# ----------------------------
-# Helper: LOT_SIZE handling
-# ----------------------------
-def adjust_quantity(client: Client, symbol: str, raw_qty: float):
-    info = client.get_symbol_info(symbol)
-    lot_filter = next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")
+def rsi(closes, n=14):
+ gains,losses=[],[]
+ for i in range(1,len(closes)):
+  d=closes[i]-closes[i-1]
+  gains.append(max(d,0));losses.append(max(-d,0))
+ ag=sum(gains[-n:])/n; al=sum(losses[-n:])/n if sum(losses[-n:]) else 1e-9
+ return 100-(100/(1+ag/al))
 
-    step_size = float(lot_filter["stepSize"])
-    min_qty = float(lot_filter["minQty"])
+def ema(vals,p):
+ k=2/(p+1); e=vals[0]
+ for v in vals[1:]: e=v*k+e*(1-k)
+ return e
 
-    precision = int(round(-math.log(step_size, 10), 0))
-    qty = math.floor(raw_qty / step_size) * step_size
-    qty = round(qty, precision)
+def backtest(symbol, tf, start, end, capital, params):
+ kl=client.get_historical_klines(symbol, tf, start, end)
+ closes=[float(k[4]) for k in kl]
+ bal=capital; pos=None; entry=0; peak=capital
+ trades=0; wins=0
 
-    if qty < min_qty:
-        return None, f"Quantity {qty} is below minimum lot size {min_qty}"
+ for i in range(60,len(closes)):
+  price=closes[i]
+  r=rsi(closes[:i],params["rsi_len"])
+  e=ema(closes[i-60:i],50)
 
-    return qty, None
+  if pos is None and r>params["buy"] and price>e:
+   pos=price; entry=price
 
-# ----------------------------
-# Webhook (SPOT)
-# ----------------------------
-@app.post("/webhook")
-async def webhook(req: Request):
-    try:
-        data = await req.json()
+  elif pos:
+   tp=entry*(1+params["tp"]/100); sl=entry*(1-params["sl"]/100)
+   if r<params["sell"] or price>=tp or price<=sl:
+    pnl=(price-entry)/entry
+    bal*=1+pnl; trades+=1; wins+=pnl>0
+    pos=None; peak=max(peak,bal)
 
-        action = data.get("action", "BUY").upper()
-        symbol = data.get("symbol", "BTCUSDT")
-        position_pct = float(data.get("position_size", 10))
-        tp_pct = float(data.get("tp_pct", 0))
-        sl_pct = float(data.get("sl_pct", 0))
+ dd=(peak-bal)/peak*100
+ score=(bal-capital)/capital*100 - dd + (wins/max(1,trades))*10
 
-        # ----------------------------
-        # Binance Spot Testnet Client
-        # ----------------------------
-        client = Client(
-            os.getenv("BINANCE_API_KEY"),
-            os.getenv("BINANCE_SECRET_KEY"),
-            testnet=True
-        )
-        client.API_URL = "https://testnet.binance.vision/api"
+ return {"end_balance":round(bal,2),"trades":trades,"win_rate":round(wins/max(1,trades)*100,2),
+         "drawdown":round(dd,2),"ai_score":round(score,2),"params":params}
 
-        # ----------------------------
-        # BUY LOGIC
-        # ----------------------------
-        if action == "BUY":
-            account = client.get_account()
-            balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
+@app.post("/backtest/run")
+async def run(req:Request):
+ d=await req.json()
+ p={"rsi_len":14,"buy":70,"sell":40,"tp":1,"sl":0.5}
+ return backtest(d["symbol"],TF_MAP[d["timeframe"]],d["start"],d["end"],d["capital"],p)
 
-            if "USDT" not in balances or balances["USDT"] <= 0:
-                return {"status": "error", "message": "No USDT balance"}
-
-            usdt_balance = balances["USDT"]
-            price = float(client.get_symbol_ticker(symbol=symbol)["price"])
-
-            raw_qty = (usdt_balance * position_pct / 100) / price
-            qty, err = adjust_quantity(client, symbol, raw_qty)
-            if err:
-                return {"status": "error", "message": err}
-
-            buy_order = client.create_order(
-                symbol=symbol,
-                side=Client.SIDE_BUY,
-                type=Client.ORDER_TYPE_MARKET,
-                quantity=qty
-            )
-
-            # Optional TP / SL
-            if tp_pct > 0:
-                tp_price = round(price * (1 + tp_pct / 100), 2)
-                client.create_order(
-                    symbol=symbol,
-                    side=Client.SIDE_SELL,
-                    type=Client.ORDER_TYPE_LIMIT,
-                    quantity=qty,
-                    price=str(tp_price),
-                    timeInForce=Client.TIME_IN_FORCE_GTC
-                )
-
-            if sl_pct > 0:
-                sl_price = round(price * (1 - sl_pct / 100), 2)
-                client.create_order(
-                    symbol=symbol,
-                    side=Client.SIDE_SELL,
-                    type=Client.ORDER_TYPE_STOP_LOSS_LIMIT,
-                    quantity=qty,
-                    stopPrice=str(sl_price),
-                    price=str(sl_price),
-                    timeInForce=Client.TIME_IN_FORCE_GTC
-                )
-
-            return {
-                "status": "success",
-                "action": "BUY",
-                "symbol": symbol,
-                "quantity": qty,
-                "price": price
-            }
-
-        # ----------------------------
-        # SELL LOGIC
-        # ----------------------------
-        elif action == "SELL":
-            asset = symbol.replace("USDT", "")
-            account = client.get_account()
-            balances = {b["asset"]: float(b["free"]) for b in account["balances"]}
-
-            if asset not in balances or balances[asset] <= 0:
-                return {"status": "error", "message": f"No {asset} balance"}
-
-            qty = balances[asset] * position_pct / 100
-
-            qty, err = adjust_quantity(client, symbol, qty)
-            if err:
-                return {"status": "error", "message": err}
-
-            sell_order = client.create_order(
-                symbol=symbol,
-                side=Client.SIDE_SELL,
-                type=Client.ORDER_TYPE_MARKET,
-                quantity=qty
-            )
-
-            return {
-                "status": "success",
-                "action": "SELL",
-                "symbol": symbol,
-                "quantity": qty
-            }
-
-        else:
-            return {"status": "error", "message": "Invalid action"}
-
-    except BinanceAPIException as e:
-        return {"status": "error", "message": f"Binance API error: {e.message}"}
-
-    except Exception as e:
-        return {"status": "error", "message": f"Server error: {str(e)}"}
+@app.post("/backtest/optimize")
+async def optimize(req:Request):
+ d=await req.json()
+ best=None
+ for rsi_len in [10,14,21]:
+  for buy in [65,70,75]:
+   for sell in [35,40,45]:
+    p={"rsi_len":rsi_len,"buy":buy,"sell":sell,"tp":1,"sl":0.5}
+    res=backtest(d["symbol"],TF_MAP[d["timeframe"]],d["start"],d["end"],d["capital"],p)
+    if not best or res["ai_score"]>best["ai_score"]:
+     best=res
+ return best
