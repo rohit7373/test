@@ -91,7 +91,13 @@ def bot_loop():
 
   time.sleep(300)
  BOT_STATE["running"]=False
-
+ 
+# In main.py:
+@app.get("/bot/status")
+def status():
+    """Returns the current status of the bot state."""
+    return BOT_STATE
+ 
 @app.post("/bot/start")
 def start():
  if not BOT_STATE["running"]:
