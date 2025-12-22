@@ -1,4 +1,4 @@
-import os, time, math, threading, datetime
+import os, time, math, threading
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from binance.client import Client
@@ -32,10 +32,11 @@ TF_MAP = {
 BOT_CONFIG = {
     "symbol": "BTCUSDT",
     "position_size": 10,
-    "rsi_sets": [],
-    "rsi_required": 2,
-    "cooldown_sec": 300,        # ⏱ min gap between trades
-    "max_daily_loss": -50,      # 💰 auto stop PnL
+    "rsi_sets": [],       # RSI definitions
+    "buy_sets": [],       # indices used for BUY
+    "sell_sets": [],      # indices used for SELL
+    "cooldown_sec": 300,
+    "max_daily_loss": -50,
     "enabled": False
 }
 
@@ -45,7 +46,6 @@ BOT_STATE = {
     "entry": None,
     "last_trade_time": 0,
     "daily_pnl": 0.0,
-    "rsi_votes": 0,
     "rsi_status": [],
     "auto_stopped": False,
     "auto_stop_reason": ""
@@ -84,10 +84,15 @@ def adjust_qty(symbol, qty):
 
 # ================= RSI COMBO =================
 def combo_rsi(symbol, side):
-    votes = 0
     status = []
+    selected = BOT_CONFIG["buy_sets"] if side == "BUY" else BOT_CONFIG["sell_sets"]
 
-    for idx, s in enumerate(BOT_CONFIG["rsi_sets"]):
+    if not selected:
+        BOT_STATE["rsi_status"] = []
+        return False
+
+    for i in selected:
+        s = BOT_CONFIG["rsi_sets"][i]
         kl = client.get_klines(
             symbol=symbol,
             interval=TF_MAP[s["tf"]],
@@ -96,25 +101,20 @@ def combo_rsi(symbol, side):
         closes = [float(k[4]) for k in kl]
         r = rsi(closes, s["length"])
 
-        passed = False
-        if side == "BUY" and r > s["buy"]:
-            passed = True
-        if side == "SELL" and r < s["sell"]:
-            passed = True
-
-        if passed:
-            votes += 1
-
+        passed = (r > s["buy"]) if side == "BUY" else (r < s["sell"])
         status.append({
-            "set": idx + 1,
+            "set": i + 1,
             "tf": s["tf"],
             "rsi": round(r, 2),
             "pass": passed
         })
 
-    BOT_STATE["rsi_votes"] = votes
+        if not passed:
+            BOT_STATE["rsi_status"] = status
+            return False
+
     BOT_STATE["rsi_status"] = status
-    return votes >= BOT_CONFIG["rsi_required"]
+    return True
 
 # ================= BOT LOOP =================
 def bot_loop():
@@ -123,13 +123,14 @@ def bot_loop():
     while BOT_CONFIG["enabled"]:
         try:
             now = time.time()
+
             if now - BOT_STATE["last_trade_time"] < BOT_CONFIG["cooldown_sec"]:
                 time.sleep(5)
                 continue
 
             if BOT_STATE["daily_pnl"] <= BOT_CONFIG["max_daily_loss"]:
                 BOT_STATE["auto_stopped"] = True
-                BOT_STATE["auto_stop_reason"] = "Max daily loss hit"
+                BOT_STATE["auto_stop_reason"] = "Max daily loss reached"
                 BOT_CONFIG["enabled"] = False
                 break
 
@@ -145,12 +146,8 @@ def bot_loop():
                 if combo_rsi(symbol, "BUY"):
                     qty = adjust_qty(symbol, (usdt * BOT_CONFIG["position_size"] / 100) / price)
                     if qty:
-                        client.create_order(
-                            symbol=symbol,
-                            side=Client.SIDE_BUY,
-                            type=Client.ORDER_TYPE_MARKET,
-                            quantity=qty
-                        )
+                        client.create_order(symbol=symbol, side=Client.SIDE_BUY,
+                                            type=Client.ORDER_TYPE_MARKET, quantity=qty)
                         BOT_STATE["position"] = "BUY"
                         BOT_STATE["entry"] = price
                         BOT_STATE["last_trade_time"] = now
@@ -160,12 +157,8 @@ def bot_loop():
                 if combo_rsi(symbol, "SELL"):
                     qty = adjust_qty(symbol, bal.get(asset, 0))
                     if qty:
-                        client.create_order(
-                            symbol=symbol,
-                            side=Client.SIDE_SELL,
-                            type=Client.ORDER_TYPE_MARKET,
-                            quantity=qty
-                        )
+                        client.create_order(symbol=symbol, side=Client.SIDE_SELL,
+                                            type=Client.ORDER_TYPE_MARKET, quantity=qty)
                         pnl = (price - BOT_STATE["entry"]) * qty
                         BOT_STATE["daily_pnl"] += pnl
                         BOT_STATE["position"] = None
@@ -183,8 +176,7 @@ def bot_loop():
 # ================= API =================
 @app.post("/bot/config")
 async def config(req: Request):
-    data = await req.json()
-    BOT_CONFIG.update(data)
+    BOT_CONFIG.update(await req.json())
     return BOT_CONFIG
 
 @app.post("/bot/start")
@@ -214,28 +206,57 @@ def status():
 def trades():
     return TRADES
 
+# ================= MANUAL =================
+@app.post("/trade/buy")
+def manual_buy():
+    symbol = BOT_CONFIG["symbol"]
+    price = float(client.get_symbol_ticker(symbol=symbol)["price"])
+    acct = client.get_account()
+    usdt = next(float(b["free"]) for b in acct["balances"] if b["asset"] == "USDT")
+    qty = adjust_qty(symbol, (usdt * BOT_CONFIG["position_size"] / 100) / price)
+    if not qty:
+        return {"status": "Error", "message": "Insufficient balance"}
+    client.create_order(symbol=symbol, side=Client.SIDE_BUY,
+                        type=Client.ORDER_TYPE_MARKET, quantity=qty)
+    BOT_STATE["position"] = "BUY"
+    BOT_STATE["entry"] = price
+    log_trade("BUY", price, qty, "MANUAL")
+    return {"status": "BUY placed"}
+
+@app.post("/trade/sell")
+def manual_sell():
+    symbol = BOT_CONFIG["symbol"]
+    asset = symbol.replace("USDT", "")
+    acct = client.get_account()
+    qty = next(float(b["free"]) for b in acct["balances"] if b["asset"] == asset)
+    qty = adjust_qty(symbol, qty)
+    if not qty:
+        return {"status": "Error", "message": "No asset to sell"}
+    price = float(client.get_symbol_ticker(symbol=symbol)["price"])
+    client.create_order(symbol=symbol, side=Client.SIDE_SELL,
+                        type=Client.ORDER_TYPE_MARKET, quantity=qty)
+    BOT_STATE["position"] = None
+    BOT_STATE["entry"] = None
+    log_trade("SELL", price, qty, "MANUAL")
+    return {"status": "SELL placed"}
+
 # ================= BACKTEST =================
 @app.post("/bot/backtest")
 async def backtest(req: Request):
     cfg = await req.json()
-    symbol = cfg["symbol"]
     kl = client.get_klines(
-        symbol=symbol,
+        symbol=cfg["symbol"],
         interval=TF_MAP[cfg["tf"]],
         start_str=cfg["start"],
         end_str=cfg["end"]
     )
-
     closes = [float(k[4]) for k in kl]
     balance = 1000
     entry = None
-
-    for i in range(len(closes)):
-        price = closes[i]
+    for price in closes:
         if entry is None:
             entry = price
         else:
             balance += price - entry
             entry = None
-
     return {"final_balance": round(balance, 2)}
