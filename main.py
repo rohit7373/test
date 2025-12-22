@@ -124,33 +124,59 @@ def status():
 
 @app.post("/trade/buy")
 def manual_buy():
-    """Executes a market BUY order using the configured position size."""
     try:
-        # Get current price
         ticker = client.get_symbol_ticker(symbol=BOT_CONFIG["symbol"])
         price = float(ticker["price"])
 
-        # Get available balance (Use the logic from your bot's run function)
         acct = client.get_account()
         usdt = next(float(b["free"]) for b in acct["balances"] if b["asset"] == "USDT")
 
-        # Calculate quantity based on position size
-        # Assuming adjust_qty is a helper function you have defined
-        qty = adjust_qty(BOT_CONFIG["symbol"], (usdt * BOT_CONFIG["position_size"] / 100) / price)
-        
-        if qty:
-            # Execute the order (DANGER: uses testnet/live account)
-            client.create_order(
-                symbol=BOT_CONFIG["symbol"],
-                side=Client.SIDE_BUY,
-                type=Client.ORDER_TYPE_MARKET,
-                quantity=qty
-            )
-            # SUCCESS RESPONSE: Must include the 'status' key
-            return {"status": "BUY order placed successfully", "price": price, "quantity": qty}
-        else:
-            # ERROR RESPONSE: Must include the 'status' key
-            return {"status": "Error", "message": "Position size is too small or balance is zero."}
+        qty = adjust_qty(
+            BOT_CONFIG["symbol"],
+            (usdt * BOT_CONFIG["position_size"] / 100) / price
+        )
+
+        if not qty:
+            return {"status": "Error", "message": "Insufficient balance"}
+
+        client.create_order(
+            symbol=BOT_CONFIG["symbol"],
+            side=Client.SIDE_BUY,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+
+        BOT_STATE["position"] = "BUY"
+        BOT_STATE["entry"] = price
+
+        return {"status": "BUY placed", "price": price, "qty": qty}
+
     except Exception as e:
-        # FAILED RESPONSE: Must include the 'status' key
+        return {"status": "Error", "message": str(e)}
+
+
+@app.post("/trade/sell")
+def manual_sell():
+    try:
+        asset = BOT_CONFIG["symbol"].replace("USDT", "")
+        acct = client.get_account()
+        qty = next(float(b["free"]) for b in acct["balances"] if b["asset"] == asset)
+
+        qty = adjust_qty(BOT_CONFIG["symbol"], qty)
+        if not qty:
+            return {"status": "Error", "message": "No asset to sell"}
+
+        client.create_order(
+            symbol=BOT_CONFIG["symbol"],
+            side=Client.SIDE_SELL,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+
+        BOT_STATE["position"] = None
+        BOT_STATE["entry"] = None
+
+        return {"status": "SELL placed", "qty": qty}
+
+    except Exception as e:
         return {"status": "Error", "message": str(e)}
