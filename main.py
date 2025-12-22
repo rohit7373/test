@@ -1,9 +1,8 @@
 
-import os, math
+import os, time, math, threading
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from binance.client import Client
-from datetime import datetime
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -11,65 +10,105 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 client = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_SECRET_KEY"), testnet=True)
 client.API_URL = "https://testnet.binance.vision/api"
 
-TF_MAP = {
- "1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","2h":"2h","4h":"4h"
+TF_MAP={
+ "1m":Client.KLINE_INTERVAL_1MINUTE,
+ "5m":Client.KLINE_INTERVAL_5MINUTE,
+ "15m":Client.KLINE_INTERVAL_15MINUTE,
+ "1h":Client.KLINE_INTERVAL_1HOUR,
+ "4h":Client.KLINE_INTERVAL_4HOUR,
 }
 
-def rsi(closes, n=14):
- gains,losses=[],[]
+BOT_CONFIG={
+ "symbol":"BTCUSDT",
+ "timeframe":"5m",
+ "rsi_length":14,
+ "buy_rsi":70,
+ "sell_rsi":40,
+ "position_size":10,
+ "tp_pct":1,
+ "sl_pct":0.5,
+ "htf_list":["15m","1h"],
+ "votes_required":2,
+ "enabled":False
+}
+
+BOT_STATE={"running":False,"position":None,"entry":None,"last_rsi":None}
+
+def rsi(closes,n):
+ g,l=[],[]
  for i in range(1,len(closes)):
   d=closes[i]-closes[i-1]
-  gains.append(max(d,0));losses.append(max(-d,0))
- ag=sum(gains[-n:])/n; al=sum(losses[-n:])/n if sum(losses[-n:]) else 1e-9
+  g.append(max(d,0));l.append(max(-d,0))
+ ag=sum(g[-n:])/n; al=sum(l[-n:])/n if sum(l[-n:]) else 1e-9
  return 100-(100/(1+ag/al))
 
-def ema(vals,p):
- k=2/(p+1); e=vals[0]
- for v in vals[1:]: e=v*k+e*(1-k)
- return e
+def adjust_qty(symbol,qty):
+ info=client.get_symbol_info(symbol)
+ f=next(x for x in info["filters"] if x["filterType"]=="LOT_SIZE")
+ step=float(f["stepSize"]); minq=float(f["minQty"])
+ qty=math.floor(qty/step)*step
+ return qty if qty>=minq else None
 
-def backtest(symbol, tf, start, end, capital, params):
- kl=client.get_historical_klines(symbol, tf, start, end)
- closes=[float(k[4]) for k in kl]
- bal=capital; pos=None; entry=0; peak=capital
- trades=0; wins=0
+def multi_tf_vote(symbol, length):
+ votes=0
+ for tf in BOT_CONFIG["htf_list"]:
+  kl=client.get_klines(symbol=symbol,interval=TF_MAP[tf],limit=length+50)
+  closes=[float(k[4]) for k in kl]
+  if rsi(closes,length)>BOT_CONFIG["buy_rsi"]:
+   votes+=1
+ return votes>=BOT_CONFIG["votes_required"]
 
- for i in range(60,len(closes)):
-  price=closes[i]
-  r=rsi(closes[:i],params["rsi_len"])
-  e=ema(closes[i-60:i],50)
+def bot_loop():
+ BOT_STATE["running"]=True
+ while BOT_CONFIG["enabled"]:
+  try:
+   kl=client.get_klines(symbol=BOT_CONFIG["symbol"],interval=TF_MAP[BOT_CONFIG["timeframe"]],limit=200)
+   closes=[float(k[4]) for k in kl]
+   price=closes[-1]
+   r=rsi(closes,BOT_CONFIG["rsi_length"])
+   BOT_STATE["last_rsi"]=round(r,2)
 
-  if pos is None and r>params["buy"] and price>e:
-   pos=price; entry=price
+   acct=client.get_account()
+   bal={b["asset"]:float(b["free"]) for b in acct["balances"]}
+   usdt=bal.get("USDT",0); asset=BOT_CONFIG["symbol"].replace("USDT","")
 
-  elif pos:
-   tp=entry*(1+params["tp"]/100); sl=entry*(1-params["sl"]/100)
-   if r<params["sell"] or price>=tp or price<=sl:
-    pnl=(price-entry)/entry
-    bal*=1+pnl; trades+=1; wins+=pnl>0
-    pos=None; peak=max(peak,bal)
+   if BOT_STATE["position"] is None:
+    if r>BOT_CONFIG["buy_rsi"] and multi_tf_vote(BOT_CONFIG["symbol"],BOT_CONFIG["rsi_length"]):
+     qty=adjust_qty(BOT_CONFIG["symbol"],(usdt*BOT_CONFIG["position_size"]/100)/price)
+     if qty:
+      client.create_order(symbol=BOT_CONFIG["symbol"],side=Client.SIDE_BUY,type=Client.ORDER_TYPE_MARKET,quantity=qty)
+      BOT_STATE["position"]="BUY"; BOT_STATE["entry"]=price
 
- dd=(peak-bal)/peak*100
- score=(bal-capital)/capital*100 - dd + (wins/max(1,trades))*10
+   elif BOT_STATE["position"]=="BUY":
+    if r<BOT_CONFIG["sell_rsi"]:
+     qty=adjust_qty(BOT_CONFIG["symbol"],bal.get(asset,0))
+     if qty:
+      client.create_order(symbol=BOT_CONFIG["symbol"],side=Client.SIDE_SELL,type=Client.ORDER_TYPE_MARKET,quantity=qty)
+      BOT_STATE["position"]=None; BOT_STATE["entry"]=None
 
- return {"end_balance":round(bal,2),"trades":trades,"win_rate":round(wins/max(1,trades)*100,2),
-         "drawdown":round(dd,2),"ai_score":round(score,2),"params":params}
+  except Exception as e:
+   print("Bot error",e)
 
-@app.post("/backtest/run")
-async def run(req:Request):
- d=await req.json()
- p={"rsi_len":14,"buy":70,"sell":40,"tp":1,"sl":0.5}
- return backtest(d["symbol"],TF_MAP[d["timeframe"]],d["start"],d["end"],d["capital"],p)
+  time.sleep(300)
+ BOT_STATE["running"]=False
 
-@app.post("/backtest/optimize")
-async def optimize(req:Request):
- d=await req.json()
- best=None
- for rsi_len in [10,14,21]:
-  for buy in [65,70,75]:
-   for sell in [35,40,45]:
-    p={"rsi_len":rsi_len,"buy":buy,"sell":sell,"tp":1,"sl":0.5}
-    res=backtest(d["symbol"],TF_MAP[d["timeframe"]],d["start"],d["end"],d["capital"],p)
-    if not best or res["ai_score"]>best["ai_score"]:
-     best=res
- return best
+@app.post("/bot/start")
+def start():
+ if not BOT_STATE["running"]:
+  BOT_CONFIG["enabled"]=True
+  threading.Thread(target=bot_loop,daemon=True).start()
+ return {"status":"started"}
+
+@app.post("/bot/stop")
+def stop():
+ BOT_CONFIG["enabled"]=False
+ return {"status":"stopped"}
+
+@app.post("/bot/config")
+async def config(req:Request):
+ BOT_CONFIG.update(await req.json())
+ return BOT_CONFIG
+
+@app.get("/bot/status")
+def status():
+ return {"config":BOT_CONFIG,"state":BOT_STATE}
