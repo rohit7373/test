@@ -114,3 +114,61 @@ async def config(req:Request):
 def status():
     """Returns the current status of the bot state."""
     return BOT_STATE
+
+# Add this code block to your main.py file, 
+# for example, after the existing @app.post("/bot/config") endpoint.
+
+@app.post("/trade/buy")
+def manual_buy():
+    """Executes a market BUY order using the configured position size."""
+    try:
+        # 1. Get current price
+        ticker = client.get_symbol_ticker(symbol=BOT_CONFIG["symbol"])
+        price = float(ticker["price"])
+
+        # 2. Get available USDT balance
+        acct = client.get_account()
+        usdt = next(float(b["free"]) for b in acct["balances"] if b["asset"] == "USDT")
+
+        # 3. Calculate and adjust quantity
+        qty = adjust_qty(BOT_CONFIG["symbol"], (usdt * BOT_CONFIG["position_size"] / 100) / price)
+        
+        if qty:
+            # 4. Execute the order
+            client.create_order(
+                symbol=BOT_CONFIG["symbol"],
+                side=Client.SIDE_BUY,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+            return {"status": "BUY order placed", "price": price, "quantity": qty}
+        else:
+            return {"status": "Error", "message": "Position size is too small or balance is zero."}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+@app.post("/trade/sell")
+def manual_sell():
+    """Executes a market SELL order for all available base asset."""
+    try:
+        # 1. Get current asset balance
+        asset = BOT_CONFIG["symbol"].replace("USDT", "")
+        acct = client.get_account()
+        asset_balance = next(float(b["free"]) for b in acct["balances"] if b["asset"] == asset)
+
+        # 2. Calculate and adjust quantity
+        qty = adjust_qty(BOT_CONFIG["symbol"], asset_balance)
+        
+        if qty:
+            # 3. Execute the order
+            client.create_order(
+                symbol=BOT_CONFIG["symbol"],
+                side=Client.SIDE_SELL,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+            return {"status": "SELL order placed", "quantity": qty}
+        else:
+            return {"status": "Error", "message": "No asset balance to sell."}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
