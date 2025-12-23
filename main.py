@@ -1,89 +1,123 @@
-import os, time, math, threading, datetime
-from fastapi import FastAPI, Request
+import os, time, threading, asyncio, json
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from binance.client import Client
+import requests
+
+# ---------------- CONFIG ----------------
+BINANCE_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
+
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
+
+client = Client(BINANCE_KEY, BINANCE_SECRET, testnet=True)
+client.API_URL = "https://testnet.binance.vision/api"
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-client = Client(os.getenv("BINANCE_API_KEY"), os.getenv("BINANCE_SECRET_KEY"), testnet=True)
-client.API_URL = "https://testnet.binance.vision/api"
-
+# ---------------- STATE ----------------
 BOT_CONFIG = {
     "symbol": "BTCUSDT",
-    "htf_fast": "1h", "htf_slow": "4h",
-    "ltf_fast": "5m", "ltf_slow": "15m",
     "rsi_len": 14,
-    "max_gap_mins": 120,
+    "tfs": ["1m","5m","15m","1h"],
+    "vote_required": 3,
     "enabled": False
 }
 
-# Added htf_crosses to track the exact moments for chart markers
-BOT_STATE = {
-    "running": False, 
-    "htf_signal": None, 
-    "htf_time": 0, 
-    "position": None, 
-    "trades": [],
-    "htf_crosses": [] 
+STATE = {
+    "price": 0,
+    "rsi": {},
+    "position": None,
+    "entry": None,
+    "pnl": 0,
+    "wins": 0,
+    "losses": 0,
+    "trades": []
 }
 
-def get_rsi(symbol, tf, length):
+clients = []
+
+# ---------------- UTIL ----------------
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN: return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+
+def get_rsi(tf):
+    kl = client.get_klines(symbol="BTCUSDT", interval=tf, limit=60)
+    closes = [float(k[4]) for k in kl]
+    gains, losses = [], []
+    for i in range(1,len(closes)):
+        d = closes[i]-closes[i-1]
+        gains.append(max(d,0))
+        losses.append(max(-d,0))
+    ag = sum(gains[-14:])/14
+    al = sum(losses[-14:])/14 if sum(losses[-14:]) else 1e-9
+    return 100 - (100/(1+ag/al))
+
+# ---------------- WS STREAM ----------------
+async def price_stream():
+    while True:
+        p = float(client.get_symbol_ticker(symbol="BTCUSDT")["price"])
+        STATE["price"] = p
+
+        votes = 0
+        for tf in BOT_CONFIG["tfs"]:
+            r = get_rsi(tf)
+            STATE["rsi"][tf] = r
+            if r > 50:
+                votes += 1
+
+        signal = votes >= BOT_CONFIG["vote_required"]
+
+        if signal and STATE["position"] is None and BOT_CONFIG["enabled"]:
+            send_telegram(f"BUY CONFIRM? Price {p}")
+            STATE["position"] = "LONG"
+            STATE["entry"] = p
+            STATE["trades"].append({"side":"BUY","price":p,"time":time.time()})
+
+        if STATE["position"] == "LONG":
+            pnl = p - STATE["entry"]
+            if pnl > 50 or pnl < -30:
+                STATE["pnl"] += pnl
+                STATE["wins"] += 1 if pnl>0 else 0
+                STATE["losses"] += 1 if pnl<=0 else 0
+                STATE["trades"].append({"side":"SELL","price":p,"time":time.time()})
+                STATE["position"] = None
+
+        payload = json.dumps({"price":p,"rsi":STATE["rsi"],"state":STATE})
+        for ws in clients:
+            await ws.send_text(payload)
+
+        await asyncio.sleep(2)
+
+@app.on_event("startup")
+async def start_bg():
+    asyncio.create_task(price_stream())
+
+# ---------------- API ----------------
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.append(ws)
     try:
-        kl = client.get_klines(symbol=symbol, interval=tf, limit=length + 50)
-        closes = [float(k[4]) for k in kl]
-        g, l = [], []
-        for i in range(1, len(closes)):
-            d = closes[i] - closes[i-1]
-            g.append(max(d, 0)); l.append(max(-d, 0))
-        ag = sum(g[-length:]) / length
-        al = sum(l[-length:]) / length if sum(l[-length:]) else 1e-9
-        return 100 - (100 / (1 + ag / al))
-    except: return 50
-
-def bot_loop():
-    BOT_STATE["running"] = True
-    while BOT_CONFIG["enabled"]:
-        try:
-            now = time.time()
-            hf = get_rsi(BOT_CONFIG["symbol"], BOT_CONFIG["htf_fast"], BOT_CONFIG["rsi_len"])
-            hs = get_rsi(BOT_CONFIG["symbol"], BOT_CONFIG["htf_slow"], BOT_CONFIG["rsi_len"])
-            
-            # Detect Yellow crossing Red
-            if hf > hs and BOT_STATE["htf_signal"] != "BUY":
-                BOT_STATE["htf_signal"], BOT_STATE["htf_time"] = "BUY", now
-                BOT_STATE["htf_crosses"].append({"time": now, "side": "UP", "val": hf})
-            elif hf < hs and BOT_STATE["htf_signal"] != "SELL":
-                BOT_STATE["htf_signal"], BOT_STATE["htf_time"] = "SELL", now
-                BOT_STATE["htf_crosses"].append({"time": now, "side": "DOWN", "val": hf})
-
-            lf = get_rsi(BOT_CONFIG["symbol"], BOT_CONFIG["ltf_fast"], BOT_CONFIG["rsi_len"])
-            ls = get_rsi(BOT_CONFIG["symbol"], BOT_CONFIG["ltf_slow"], BOT_CONFIG["rsi_len"])
-            
-            gap = (now - BOT_STATE["htf_time"]) / 60
-            if BOT_STATE["position"] is None and BOT_STATE["htf_signal"] == "BUY" and lf > ls and gap <= BOT_CONFIG["max_gap_mins"]:
-                BOT_STATE["position"] = "LONG"
-                BOT_STATE["trades"].append({"time": now, "side": "BUY", "price": "MARKET"})
-            
-            elif BOT_STATE["position"] == "LONG" and BOT_STATE["htf_signal"] == "SELL" and lf < ls:
-                BOT_STATE["position"] = None
-                BOT_STATE["trades"].append({"time": now, "side": "SELL", "price": "MARKET"})
-        except: pass
-        time.sleep(30)
-    BOT_STATE["running"] = False
+        while True:
+            await ws.receive_text()
+    except:
+        clients.remove(ws)
 
 @app.post("/bot/start")
 def start():
-    if not BOT_STATE["running"]:
-        BOT_CONFIG["enabled"] = True
-        threading.Thread(target=bot_loop, daemon=True).start()
-    return {"status": "started"}
+    BOT_CONFIG["enabled"] = True
+    return {"ok":True}
 
 @app.post("/bot/stop")
 def stop():
     BOT_CONFIG["enabled"] = False
-    return {"status": "stopped"}
+    return {"ok":True}
 
 @app.get("/bot/status")
 def status():
-    return {"config": BOT_CONFIG, "state": BOT_STATE}
+    return STATE
