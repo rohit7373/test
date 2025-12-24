@@ -3,14 +3,18 @@ import time
 import pandas as pd
 import pandas_ta as ta
 import ccxt
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 from datetime import datetime
 import os
 
 app = Flask(__name__)
 
+# --- ENABLE CORS ---
+# This allows your Netlify frontend to talk to this Railway backend
+CORS(app) 
+
 # --- CONFIGURATION & STATE ---
-# Global state to track wallet, positions, and history
 BOT_STATE = {
     "is_running": False,
     "wallet_balance": 1000.00,
@@ -18,7 +22,6 @@ BOT_STATE = {
     "trades": [], 
 }
 
-# Default Bot Configuration 
 BOT_CONFIG = {
     "symbol": "BTC/USDT",
     "strategy_mode": "BOTH", 
@@ -27,7 +30,6 @@ BOT_CONFIG = {
     "bot_qty": 0.1, "bot_tp": 1.5, "bot_sl": 1.0
 }
 
-# Initialize Binance Exchange
 exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
@@ -42,8 +44,6 @@ def fetch_rsi_data(symbol, timeframe, limit=50):
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Calculate RSI
         df['rsi'] = ta.rsi(df['close'], length=14)
         df = df.dropna()
         
@@ -66,11 +66,8 @@ def execute_trade(source, side, qty, price):
 
     pos_type = "LONG" if side == "BUY" else "SHORT"
     BOT_STATE["positions"][source] = {
-        "type": pos_type,
-        "entry": price,
-        "qty": qty
+        "type": pos_type, "entry": price, "qty": qty
     }
-    
     log_trade(source, f"{side} ({pos_type})", qty, price)
     print(f"[{source.upper()}] Executed {side} at {price}")
 
@@ -89,11 +86,8 @@ def close_position(source, price):
 def log_trade(source, side, qty, price, pnl=None):
     rec = {
         "time": datetime.now().strftime("%H:%M:%S"),
-        "source": source,
-        "side": side,
-        "qty": qty,
-        "price": price,
-        "pnl": pnl
+        "source": source, "side": side, "qty": qty,
+        "price": price, "pnl": pnl
     }
     BOT_STATE["trades"].insert(0, rec)
 
@@ -127,10 +121,8 @@ def bot_loop():
 
                     if trigger and BOT_STATE["positions"]["bot"] is None:
                         execute_trade("bot", "BUY", BOT_CONFIG["bot_qty"], price)
-
             except Exception as e:
                 print(f"Bot Loop Error: {e}")
-        
         time.sleep(2)
 
 t = threading.Thread(target=bot_loop, daemon=True)
@@ -140,7 +132,8 @@ t.start()
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    # Since HTML is on Netlify, the root URL just confirms the server is up.
+    return jsonify({"status": "Bot Backend is Running", "frontend": "Hosted on Netlify"})
 
 @app.route('/api/market_data', methods=['GET'])
 def get_data():
@@ -207,6 +200,5 @@ def close_all():
     return jsonify({"status": "closed"})
 
 if __name__ == '__main__':
-    # Use PORT environment variable if available (Railway requirement)
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
