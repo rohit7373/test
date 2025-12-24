@@ -1,208 +1,115 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>RSI Bot V7 – Final</title>
+import os, time, threading
+import pandas as pd
+import pandas_ta as ta
+import ccxt
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+import uvicorn
 
-<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-<style>
-:root{
-  --bg:#0d1117;--panel:#161b22;--border:#30363d;
-  --green:#238636;--red:#da3633;--blue:#58a6ff
-}
-body{
-  margin:0;height:100vh;display:flex;
-  background:var(--bg);color:#c9d1d9;
-  font-family:Segoe UI,system-ui
-}
-.sidebar{
-  width:340px;background:var(--panel);
-  border-right:1px solid var(--border);
-  padding:10px;overflow-y:auto
-}
-.section{
-  border:1px solid var(--border);
-  border-radius:6px;padding:10px;margin-bottom:10px
-}
-.title{color:var(--blue);font-weight:bold;margin-bottom:6px}
-.row{display:flex;justify-content:space-between;margin-bottom:6px}
-select,input,button{
-  background:#0d1117;border:1px solid var(--border);
-  color:white;padding:6px;border-radius:4px;width:100%
-}
-button{cursor:pointer;font-weight:bold}
-.green{background:var(--green)}
-.red{background:var(--red)}
-.orange{background:#d29922;color:black}
+exchange = ccxt.binance({"enableRateLimit": True})
+SYMBOL = "BTC/USDT"
 
-.main{
-  flex:1;display:flex;flex-direction:column;padding:6px;gap:6px
-}
-.grid4{
-  flex:7;display:grid;
-  grid-template-columns:1fr 1fr;
-  grid-template-rows:1fr 1fr;gap:6px
-}
-.grid2{
-  flex:3;display:grid;
-  grid-template-columns:1fr 1fr;gap:6px
-}
-.chart-box{
-  border:1px solid var(--border);
-  position:relative
-}
-.chart-label{
-  position:absolute;top:4px;left:6px;
-  background:#000a;padding:2px 6px;
-  font-size:11px;color:var(--blue);z-index:5
-}
-.chart{width:100%;height:100%}
-</style>
-</head>
-
-<body>
-
-<!-- ================= LEFT SIDEBAR (UNCHANGED) ================= -->
-<div class="sidebar">
-
-  <div class="section">
-    <div class="row"><b>Wallet:</b> $<span id="wallet">1000.00</span></div>
-    <div class="row"><span>Bot Unrl PnL:</span><span id="botPnl">0.00</span></div>
-    <div class="row"><span>Time:</span><span id="time">--</span></div>
-    <div class="row"><span>Price:</span><span id="price">--</span></div>
-  </div>
-
-  <div class="section">
-    <div class="title">BOT CONFIGURATION (V7)</div>
-    <div class="row"><span>Status:</span><span id="status" style="color:red">STOPPED</span></div>
-
-    <div class="row">
-      <span>Strategy Mode</span>
-      <select id="mode">
-        <option>Both (1 & 2)</option>
-      </select>
-    </div>
-
-    <div class="title">1. STF CONFIRMATION</div>
-    <div class="row"><span>TF 1</span><select id="stf1"><option>1m</option><option>5m</option></select></div>
-    <div class="row"><span>TF 2</span><select id="stf2"><option>5m</option><option>15m</option></select></div>
-
-    <div class="title">2. LTF CONFIRMATION</div>
-    <div class="row"><span>TF 1</span><select id="ltf1"><option>1h</option><option>4h</option></select></div>
-    <div class="row"><span>TF 2</span><select id="ltf2"><option>1h</option><option>4h</option></select></div>
-
-    <div class="row"><span>Bot Qty</span><input id="qty" value="0.1"></div>
-    <button class="green" onclick="startBot()">START BOT</button>
-  </div>
-
-  <div class="section">
-    <div class="title">MANUAL OVERRIDE</div>
-    <button class="green">BUY / LONG</button>
-    <button class="red">SELL / SHORT</button>
-    <button class="orange">CLOSE ALL</button>
-  </div>
-
-</div>
-
-<!-- ================= MAIN CHART AREA ================= -->
-<div class="main">
-
-  <!-- 4 PRICE CHARTS -->
-  <div class="grid4">
-    <div class="chart-box"><div class="chart-label">STF TF-1</div><div id="c1" class="chart"></div></div>
-    <div class="chart-box"><div class="chart-label">STF TF-2</div><div id="c2" class="chart"></div></div>
-    <div class="chart-box"><div class="chart-label">LTF TF-1</div><div id="c3" class="chart"></div></div>
-    <div class="chart-box"><div class="chart-label">LTF TF-2</div><div id="c4" class="chart"></div></div>
-  </div>
-
-  <!-- RSI CHARTS -->
-  <div class="grid2">
-    <div class="chart-box"><div class="chart-label">STF RSI (TF1 vs TF2)</div><div id="rsi1" class="chart"></div></div>
-    <div class="chart-box"><div class="chart-label">LTF RSI (TF1 vs TF2)</div><div id="rsi2" class="chart"></div></div>
-  </div>
-
-</div>
-
-<script>
-axios.defaults.baseURL="http://localhost:8000";
-
-/* ---------- CHART CREATION ---------- */
-function mkChart(id){
-  return LightweightCharts.createChart(
-    document.getElementById(id),
-    {layout:{backgroundColor:'#000',textColor:'#ccc'},timeScale:{timeVisible:true}}
-  )
-}
-const charts={
-  c1:mkChart('c1'),c2:mkChart('c2'),c3:mkChart('c3'),c4:mkChart('c4')
-}
-const candles={
-  c1:charts.c1.addCandlestickSeries(),
-  c2:charts.c2.addCandlestickSeries(),
-  c3:charts.c3.addCandlestickSeries(),
-  c4:charts.c4.addCandlestickSeries()
+STATE = {
+    "running": False,
+    "wallet": 1000.0,
+    "position": None,
+    "entry": 0.0,
+    "qty": 0.1,
+    "unrealized": 0.0,
+    "trades": []
 }
 
-const rsi1=mkChart('rsi1'),rsi2=mkChart('rsi2');
-const rsi1a=rsi1.addLineSeries({color:'#22d3ee'});
-const rsi1b=rsi1.addLineSeries({color:'#f59e0b'});
-const rsi2a=rsi2.addLineSeries({color:'#a855f7'});
-const rsi2b=rsi2.addLineSeries({color:'#f59e0b'});
-
-/* ---------- RSI CROSS LOGIC ---------- */
-function rsiCross(a,b){
-  let m=[];
-  for(let i=1;i<Math.min(a.length,b.length);i++){
-    let p=a[i-1].value-b[i-1].value;
-    let c=a[i].value-b[i].value;
-    if(p<0&&c>0) m.push({time:a[i].time,shape:'diamond',color:'#22c55e',position:'inBar'});
-    if(p>0&&c<0) m.push({time:a[i].time,shape:'diamond',color:'#ef4444',position:'inBar'});
-  }
-  return m;
+TF_MAP = {
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m",
+    "1h":"1h","4h":"4h","1d":"1d","1w":"1w"
 }
 
-/* ---------- UPDATE LOOP ---------- */
-async function update(){
-  const res=await axios.get('/api/market',{
-    params:{
-      stf1:stf1.value,stf2:stf2.value,
-      ltf1:ltf1.value,ltf2:ltf2.value
+def fetch_candles(tf, limit=300):
+    tf = TF_MAP.get(tf, "1m")
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, tf, limit=limit)
+    df = pd.DataFrame(
+        ohlcv, columns=["time","open","high","low","close","volume"]
+    )
+    df["time"] = (df["time"] / 1000).astype(int)
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    df.dropna(inplace=True)
+    return df
+
+def last_price():
+    return float(exchange.fetch_ticker(SYMBOL)["last"])
+
+def bot_loop():
+    while True:
+        if STATE["running"]:
+            try:
+                df_f = fetch_candles("1m")
+                df_s = fetch_candles("5m")
+                rsi_f = df_f["rsi"].iloc[-1]
+                rsi_s = df_s["rsi"].iloc[-1]
+                price = last_price()
+
+                if STATE["position"]:
+                    diff = price - STATE["entry"]
+                    if STATE["position"] == "SHORT":
+                        diff = -diff
+                    STATE["unrealized"] = round(diff * STATE["qty"], 2)
+
+                if rsi_f > rsi_s and STATE["position"] is None:
+                    STATE["position"] = "LONG"
+                    STATE["entry"] = price
+                    STATE["trades"].insert(0,{
+                        "time": datetime.now().strftime("%I:%M:%S %p"),
+                        "side":"BUY",
+                        "price":price,
+                        "pnl":0
+                    })
+
+                elif rsi_f < rsi_s and STATE["position"] == "LONG":
+                    pnl = (price - STATE["entry"]) * STATE["qty"]
+                    STATE["wallet"] += pnl
+                    STATE["trades"][0]["pnl"] = round(pnl,2)
+                    STATE["position"] = None
+                    STATE["unrealized"] = 0
+
+            except Exception as e:
+                print("BOT ERROR:", e)
+
+        time.sleep(2)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+@app.get("/api/market")
+def market(stf1:str, stf2:str, ltf1:str, ltf2:str):
+    def pack(df):
+        return df[["time","open","high","low","close","rsi"]].to_dict("records")
+
+    return {
+        "price": last_price(),
+        "stf1": pack(fetch_candles(stf1)),
+        "stf2": pack(fetch_candles(stf2)),
+        "ltf1": pack(fetch_candles(ltf1)),
+        "ltf2": pack(fetch_candles(ltf2)),
+        "state": STATE
     }
-  });
-  const d=res.data;
 
-  document.getElementById('wallet').innerText=d.state.wallet.toFixed(2);
-  document.getElementById('botPnl').innerText=d.state.unrealized.toFixed(2);
-  document.getElementById('price').innerText=d.price.toFixed(2);
-  document.getElementById('time').innerText=new Date().toLocaleTimeString('en-US',{hour12:true});
+@app.post("/api/start")
+def start():
+    STATE["running"] = True
+    return {"ok":True}
 
-  candles.c1.setData(d.stf1.map(x=>x));
-  candles.c2.setData(d.stf2.map(x=>x));
-  candles.c3.setData(d.ltf1.map(x=>x));
-  candles.c4.setData(d.ltf2.map(x=>x));
+@app.post("/api/stop")
+def stop():
+    STATE["running"] = False
+    return {"ok":True}
 
-  const s1=d.stf1.map(x=>({time:x.time,value:x.rsi}));
-  const s2=d.stf2.map(x=>({time:x.time,value:x.rsi}));
-  rsi1a.setData(s1); rsi1b.setData(s2);
-  rsi1a.setMarkers(rsiCross(s1,s2));
-
-  const l1=d.ltf1.map(x=>({time:x.time,value:x.rsi}));
-  const l2=d.ltf2.map(x=>({time:x.time,value:x.rsi}));
-  rsi2a.setData(l1); rsi2b.setData(l2);
-  rsi2a.setMarkers(rsiCross(l1,l2));
-}
-
-setInterval(update,2000);
-update();
-
-function startBot(){
-  axios.post('/api/start');
-  status.innerText='RUNNING';
-  status.style.color='lime';
-}
-</script>
-
-</body>
-</html>
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
