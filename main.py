@@ -32,7 +32,12 @@ TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m",
     "1h":"1h","4h":"4h","1d":"1d","1w":"1w"
 }
-
+# --- ADD THIS BLOCK ---
+CACHE = {
+    "last_update": 0,
+    "data": None
+}
+# ----------------------
 def fetch_candles(tf, limit=300):
     tf = TF_MAP.get(tf, "1m")
     ohlcv = exchange.fetch_ohlcv(SYMBOL, tf, limit=limit)
