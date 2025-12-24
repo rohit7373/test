@@ -1,204 +1,215 @@
+import os
 import threading
 import time
 import pandas as pd
 import pandas_ta as ta
 import ccxt
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-import os
 
-app = Flask(__name__)
+# --- APP SETUP ---
+app = FastAPI()
 
-# --- ENABLE CORS ---
-# This allows your Netlify frontend to talk to this Railway backend
-CORS(app) 
+# Allow CORS so your HTML frontend can talk to this backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- CONFIGURATION & STATE ---
-BOT_STATE = {
-    "is_running": False,
-    "wallet_balance": 1000.00,
-    "positions": {"bot": None, "manual": None}, 
-    "trades": [], 
-}
-
-BOT_CONFIG = {
-    "symbol": "BTC/USDT",
-    "strategy_mode": "BOTH", 
-    "stf1": "1m", "stf2": "5m", "stf_logic": ">",
-    "ltf1": "4h", "ltf2": "1h", "ltf_logic": ">",
-    "bot_qty": 0.1, "bot_tp": 1.5, "bot_sl": 1.0
-}
-
+# --- EXCHANGE SETUP ---
 exchange = ccxt.binance({
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
+    'options': {'defaultType': 'future'} 
 })
 
+# --- CONFIGURATION & STATE ---
+BOT_CONFIG = {
+    "symbol": "BTC/USDT",
+    "htf_fast": "1h",
+    "htf_slow": "4h",
+    "ltf_fast": "5m",
+    "ltf_slow": "15m",
+    "bot_qty": 0.001,
+    "strategy_mode": "BOTH"
+}
+
+BOT_STATE = {
+    "running": False,
+    "htf_signal": "WAIT",
+    "wallet_balance": 1000.0,
+    "position": None,      # None, "LONG", or "SHORT"
+    "entry_price": 0.0,
+    "pos_size": 0.0,
+    "trades": []
+}
+
 # --- HELPER FUNCTIONS ---
-
-def fetch_rsi_data(symbol, timeframe, limit=50):
+def get_rsi_value(symbol, timeframe, length=14):
+    """Fetches candles and calculates the latest RSI value."""
     try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        if not ohlcv: return []
-        
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        df = df.dropna()
-        
-        data = []
-        for index, row in df.iterrows():
-            data.append({
-                'time': int(row['timestamp'].timestamp()),
-                'open': row['open'], 'high': row['high'],
-                'low': row['low'], 'close': row['close'],
-                'volume': row['volume'], 'rsi': row['rsi']
-            })
-        return data
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+        if not ohlcv: return 50
+        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        df['rsi'] = ta.rsi(df['close'], length=length)
+        if pd.isna(df['rsi'].iloc[-1]): return 50
+        return float(df['rsi'].iloc[-1])
     except Exception as e:
-        print(f"Error fetching {timeframe}: {e}")
-        return []
+        print(f"[Data Error] {timeframe}: {e}")
+        return 50
 
-def execute_trade(source, side, qty, price):
-    if BOT_STATE["positions"][source] is not None:
-        close_position(source, price)
+def get_current_price(symbol):
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        return float(ticker['last'])
+    except:
+        return 0.0
 
-    pos_type = "LONG" if side == "BUY" else "SHORT"
-    BOT_STATE["positions"][source] = {
-        "type": pos_type, "entry": price, "qty": qty
-    }
-    log_trade(source, f"{side} ({pos_type})", qty, price)
-    print(f"[{source.upper()}] Executed {side} at {price}")
+def execute_trade(side, order_type, qty, price, reason="BOT"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
 
-def close_position(source, price):
-    pos = BOT_STATE["positions"][source]
-    if not pos: return
+    # 1. Close Opposite Position if exists
+    if BOT_STATE["position"]:
+        if (BOT_STATE["position"] == "LONG" and side == "SELL") or \
+           (BOT_STATE["position"] == "SHORT" and side == "BUY"):
+            close_position(price)
 
-    diff = price - pos["entry"]
-    if pos["type"] == "SHORT": diff = -diff
-    pnl = diff * pos["qty"]
+    # 2. Open New Position
+    if BOT_STATE["position"] is None:
+        BOT_STATE["position"] = "LONG" if side == "BUY" else "SHORT"
+        BOT_STATE["entry_price"] = price
+        BOT_STATE["pos_size"] = qty
+        
+        log_entry = {
+            "time": timestamp,
+            "side": side,
+            "type": reason,
+            "price": price,
+            "pnl": 0.0
+        }
+        BOT_STATE["trades"].insert(0, log_entry)
+        print(f"[{timestamp}] OPEN {side} @ {price}")
+
+def close_position(price):
+    if not BOT_STATE["position"]: return
+
+    qty = BOT_STATE["pos_size"]
+    entry = BOT_STATE["entry_price"]
+    is_long = BOT_STATE["position"] == "LONG"
     
-    BOT_STATE["wallet_balance"] += pnl
-    log_trade(source, "CLOSE", pos["qty"], price, pnl)
-    BOT_STATE["positions"][source] = None
+    # Calculate PnL
+    diff = price - entry
+    if not is_long: diff = -diff
+    pnl = diff * qty
 
-def log_trade(source, side, qty, price, pnl=None):
-    rec = {
+    BOT_STATE["wallet_balance"] += pnl
+    
+    log_entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
-        "source": source, "side": side, "qty": qty,
-        "price": price, "pnl": pnl
+        "side": "SELL" if is_long else "BUY",
+        "type": "CLOSE",
+        "price": price,
+        "pnl": round(pnl, 2)
     }
-    BOT_STATE["trades"].insert(0, rec)
+    BOT_STATE["trades"].insert(0, log_entry)
+    
+    BOT_STATE["position"] = None
+    BOT_STATE["entry_price"] = 0.0
+    BOT_STATE["pos_size"] = 0.0
+    print(f"Closed Position. PnL: {pnl:.2f}")
 
 # --- BOT LOGIC LOOP ---
-
-def bot_loop():
-    print("Background Bot Thread Started...")
+def bot_logic_loop():
+    print("--- Bot Loop Thread Started ---")
     while True:
-        if BOT_STATE["is_running"]:
+        if BOT_STATE["running"]:
             try:
-                s1 = fetch_rsi_data(BOT_CONFIG["symbol"], BOT_CONFIG["stf1"], 20)
-                s2 = fetch_rsi_data(BOT_CONFIG["symbol"], BOT_CONFIG["stf2"], 20)
-                l1 = fetch_rsi_data(BOT_CONFIG["symbol"], BOT_CONFIG["ltf1"], 20)
-                l2 = fetch_rsi_data(BOT_CONFIG["symbol"], BOT_CONFIG["ltf2"], 20)
+                sym = BOT_CONFIG["symbol"]
+                price = get_current_price(sym)
+                
+                # Fetch RSI values
+                rh_f = get_rsi_value(sym, BOT_CONFIG["htf_fast"])
+                rh_s = get_rsi_value(sym, BOT_CONFIG["htf_slow"])
+                rl_f = get_rsi_value(sym, BOT_CONFIG["ltf_fast"])
+                rl_s = get_rsi_value(sym, BOT_CONFIG["ltf_slow"])
+                
+                # Determine Signals
+                htf_bull = rh_f > rh_s
+                ltf_bull = rl_f > rl_s
+                
+                BOT_STATE["htf_signal"] = "UP (Bullish)" if htf_bull else "DOWN (Bearish)"
 
-                if s1 and s2 and l1 and l2:
-                    price = s1[-1]['close']
-                    r_s1 = s1[-1]['rsi']
-                    r_s2 = s2[-1]['rsi']
-                    r_l1 = l1[-1]['rsi']
-                    r_l2 = l2[-1]['rsi']
+                # Execution Logic
+                # BUY: HTF Bull + LTF Bull + No Position
+                if htf_bull and ltf_bull:
+                    if BOT_STATE["position"] is None:
+                        execute_trade("BUY", "MARKET", BOT_CONFIG["bot_qty"], price, "SIGNAL")
+                    elif BOT_STATE["position"] == "SHORT":
+                        close_position(price)
 
-                    stf_ok = (r_s1 > r_s2) if BOT_CONFIG["stf_logic"] == ">" else (r_s1 < r_s2)
-                    ltf_ok = (r_l1 > r_l2) if BOT_CONFIG["ltf_logic"] == ">" else (r_l1 < r_l2)
+                # SELL: HTF Bear + LTF Bear + No Position
+                elif not htf_bull and not ltf_bull:
+                    if BOT_STATE["position"] is None:
+                        execute_trade("SELL", "MARKET", BOT_CONFIG["bot_qty"], price, "SIGNAL")
+                    elif BOT_STATE["position"] == "LONG":
+                        close_position(price)
 
-                    trigger = False
-                    mode = BOT_CONFIG["strategy_mode"]
-                    if mode == "1" and stf_ok: trigger = True
-                    elif mode == "2" and ltf_ok: trigger = True
-                    elif mode == "BOTH" and stf_ok and ltf_ok: trigger = True
-
-                    if trigger and BOT_STATE["positions"]["bot"] is None:
-                        execute_trade("bot", "BUY", BOT_CONFIG["bot_qty"], price)
             except Exception as e:
-                print(f"Bot Loop Error: {e}")
-        time.sleep(2)
+                print(f"Loop Logic Error: {e}")
+        
+        time.sleep(2) # Check every 2 seconds
 
-t = threading.Thread(target=bot_loop, daemon=True)
+# Start the background thread
+t = threading.Thread(target=bot_logic_loop, daemon=True)
 t.start()
 
 # --- API ENDPOINTS ---
-
-@app.route('/')
+@app.get("/")
 def index():
-    # Since HTML is on Netlify, the root URL just confirms the server is up.
-    return jsonify({"status": "Bot Backend is Running", "frontend": "Hosted on Netlify"})
+    return {"status": "Bot Backend Running"}
 
-@app.route('/api/market_data', methods=['GET'])
-def get_data():
-    symbol = request.args.get('symbol', 'BTC/USDT')
-    
-    if not BOT_STATE["is_running"]:
-        BOT_CONFIG["stf1"] = request.args.get('stf1', '1m')
-        BOT_CONFIG["stf2"] = request.args.get('stf2', '5m')
-        BOT_CONFIG["ltf1"] = request.args.get('ltf1', '4h')
-        BOT_CONFIG["ltf2"] = request.args.get('ltf2', '1h')
-        BOT_CONFIG["stf_logic"] = request.args.get('stf_logic', '>')
-        BOT_CONFIG["ltf_logic"] = request.args.get('ltf_logic', '>')
-
-    stf1 = fetch_rsi_data(symbol, BOT_CONFIG["stf1"])
-    stf2 = fetch_rsi_data(symbol, BOT_CONFIG["stf2"])
-    ltf1 = fetch_rsi_data(symbol, BOT_CONFIG["ltf1"])
-    ltf2 = fetch_rsi_data(symbol, BOT_CONFIG["ltf2"])
-    
-    curr_price = stf1[-1]['close'] if stf1 else 0
-
-    def calc_pnl(pos):
-        if not pos: return 0.0
-        diff = curr_price - pos['entry']
-        if pos['type'] == 'SHORT': diff = -diff
-        return diff * pos['qty']
-
-    return jsonify({
-        'stf1': stf1, 'stf2': stf2,
-        'ltf1': ltf1, 'ltf2': ltf2,
-        'current_price': curr_price,
-        'state': {
-            'is_running': BOT_STATE["is_running"],
-            'wallet': BOT_STATE["wallet_balance"],
-            'bot_pnl': calc_pnl(BOT_STATE["positions"]["bot"]),
-            'manual_pnl': calc_pnl(BOT_STATE["positions"]["manual"]),
-            'trades': BOT_STATE["trades"]
+@app.get("/bot/status")
+def get_status():
+    return {
+        "config": BOT_CONFIG,
+        "state": {
+            "running": BOT_STATE["running"],
+            "htf_signal": BOT_STATE["htf_signal"],
+            "position": BOT_STATE["position"],
+            "wallet": BOT_STATE["wallet_balance"],
+            "trades": BOT_STATE["trades"][:50]
         }
-    })
+    }
 
-@app.route('/api/bot/start', methods=['POST'])
+@app.post("/bot/start")
 def start_bot():
-    data = request.json
-    BOT_CONFIG["strategy_mode"] = data.get("strategy_mode", "BOTH")
-    BOT_CONFIG["bot_qty"] = float(data.get("bot_qty", 0.1))
-    BOT_STATE["is_running"] = True
-    return jsonify({"status": "started"})
+    BOT_STATE["running"] = True
+    return {"status": "started"}
 
-@app.route('/api/bot/stop', methods=['POST'])
+@app.post("/bot/stop")
 def stop_bot():
-    BOT_STATE["is_running"] = False
-    return jsonify({"status": "stopped"})
+    BOT_STATE["running"] = False
+    return {"status": "stopped"}
 
-@app.route('/api/manual/trade', methods=['POST'])
-def manual_trade():
-    d = request.json
-    execute_trade("manual", d['side'], float(d['qty']), float(d['price']))
-    return jsonify({"status": "executed"})
+@app.post("/bot/config")
+async def update_config(req: Request):
+    data = await req.json()
+    BOT_CONFIG.update(data)
+    return {"status": "updated", "config": BOT_CONFIG}
 
-@app.route('/api/close_all', methods=['POST'])
-def close_all():
-    price = float(request.json.get('price', 0))
-    close_position("bot", price)
-    close_position("manual", price)
-    return jsonify({"status": "closed"})
+@app.post("/bot/manual")
+async def manual_trade(req: Request):
+    data = await req.json()
+    side = data.get("side")
+    qty = float(data.get("qty", 0.001))
+    price = float(data.get("price", 0) or get_current_price(BOT_CONFIG["symbol"]))
+    execute_trade(side, "MARKET", qty, price, "MANUAL")
+    return {"status": "executed"}
 
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    # RAILWAY CONFIGURATION
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
