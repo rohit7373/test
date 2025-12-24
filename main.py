@@ -75,6 +75,7 @@ def last_price():
         return 0.0
 
 # --- BACKGROUND BOT LOOP ---
+# --- BACKGROUND BOT LOOP (CORRECTED CROSS LOGIC) ---
 def bot_loop():
     while True:
         try:
@@ -93,31 +94,56 @@ def bot_loop():
 
             # 2. Automated Strategy Logic
             if STATE["running"]:
+                # Fetch fresh candles (Fast = 1m, Slow = 5m)
                 df_f = fetch_candles("1m")
                 df_s = fetch_candles("5m")
                 
-                if not df_f.empty and not df_s.empty:
-                    rsi_f = df_f["rsi"].iloc[-1]
-                    rsi_s = df_s["rsi"].iloc[-1]
+                # We need at least 2 candles to check "Previous" vs "Current"
+                if len(df_f) >= 2 and len(df_s) >= 2:
+                    
+                    # --- GET DATA POINTS ---
+                    # Current (Most recent closed candle)
+                    curr_f = df_f["rsi"].iloc[-1]
+                    curr_s = df_s["rsi"].iloc[-1]
+                    
+                    # Previous (The candle before the current one)
+                    prev_f = df_f["rsi"].iloc[-2]
+                    prev_s = df_s["rsi"].iloc[-2]
 
-                    # Only open auto-trade if none exist
+                    # Check if we already have an auto-trade open
                     has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
                     if not has_auto_trade:
-                        if rsi_f > rsi_s: # LONG SIGNAL
+                        
+                        # --- BUY LOGIC (Green) ---
+                        # Fast was BELOW Slow, NOW Fast is ABOVE Slow
+                        if prev_f <= prev_s and curr_f > curr_s:
+                            print(f"CROSS DETECTED: BUY (Fast {curr_f:.2f} > Slow {curr_s:.2f})")
                             new_trade = {
                                 "id": str(uuid.uuid4())[:8],
                                 "side": "LONG",
                                 "size": 0.01,
                                 "entryPrice": current_price,
-                                "sl": None,
-                                "tp": None,
-                                "pnl": 0.0,
+                                "sl": None, "tp": None, "pnl": 0.0,
                                 "auto": True,
                                 "time": datetime.now().isoformat()
                             }
                             STATE["openTrades"].append(new_trade)
-                            print("Auto LONG opened")
+
+                        # --- SELL LOGIC (Red) ---
+                        # Fast was ABOVE Slow, NOW Fast is BELOW Slow
+                        elif prev_f >= prev_s and curr_f < curr_s:
+                            print(f"CROSS DETECTED: SELL (Fast {curr_f:.2f} < Slow {curr_s:.2f})")
+                            new_trade = {
+                                "id": str(uuid.uuid4())[:8],
+                                "side": "SHORT",
+                                "size": 0.01,
+                                "entryPrice": current_price,
+                                "sl": None, "tp": None, "pnl": 0.0,
+                                "auto": True,
+                                "time": datetime.now().isoformat()
+                            }
+                            STATE["openTrades"].append(new_trade)
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
