@@ -1,215 +1,208 @@
-import os
-import threading
-import time
-import pandas as pd
-import pandas_ta as ta
-import ccxt
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RSI Bot V7 – Final</title>
 
-# --- APP SETUP ---
-app = FastAPI()
+<script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
 
-# Allow CORS so your HTML frontend can talk to this backend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--border:#30363d;
+  --green:#238636;--red:#da3633;--blue:#58a6ff
+}
+body{
+  margin:0;height:100vh;display:flex;
+  background:var(--bg);color:#c9d1d9;
+  font-family:Segoe UI,system-ui
+}
+.sidebar{
+  width:340px;background:var(--panel);
+  border-right:1px solid var(--border);
+  padding:10px;overflow-y:auto
+}
+.section{
+  border:1px solid var(--border);
+  border-radius:6px;padding:10px;margin-bottom:10px
+}
+.title{color:var(--blue);font-weight:bold;margin-bottom:6px}
+.row{display:flex;justify-content:space-between;margin-bottom:6px}
+select,input,button{
+  background:#0d1117;border:1px solid var(--border);
+  color:white;padding:6px;border-radius:4px;width:100%
+}
+button{cursor:pointer;font-weight:bold}
+.green{background:var(--green)}
+.red{background:var(--red)}
+.orange{background:#d29922;color:black}
 
-# --- EXCHANGE SETUP ---
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'} 
-})
+.main{
+  flex:1;display:flex;flex-direction:column;padding:6px;gap:6px
+}
+.grid4{
+  flex:7;display:grid;
+  grid-template-columns:1fr 1fr;
+  grid-template-rows:1fr 1fr;gap:6px
+}
+.grid2{
+  flex:3;display:grid;
+  grid-template-columns:1fr 1fr;gap:6px
+}
+.chart-box{
+  border:1px solid var(--border);
+  position:relative
+}
+.chart-label{
+  position:absolute;top:4px;left:6px;
+  background:#000a;padding:2px 6px;
+  font-size:11px;color:var(--blue);z-index:5
+}
+.chart{width:100%;height:100%}
+</style>
+</head>
 
-# --- CONFIGURATION & STATE ---
-BOT_CONFIG = {
-    "symbol": "BTC/USDT",
-    "htf_fast": "1h",
-    "htf_slow": "4h",
-    "ltf_fast": "5m",
-    "ltf_slow": "15m",
-    "bot_qty": 0.001,
-    "strategy_mode": "BOTH"
+<body>
+
+<!-- ================= LEFT SIDEBAR (UNCHANGED) ================= -->
+<div class="sidebar">
+
+  <div class="section">
+    <div class="row"><b>Wallet:</b> $<span id="wallet">1000.00</span></div>
+    <div class="row"><span>Bot Unrl PnL:</span><span id="botPnl">0.00</span></div>
+    <div class="row"><span>Time:</span><span id="time">--</span></div>
+    <div class="row"><span>Price:</span><span id="price">--</span></div>
+  </div>
+
+  <div class="section">
+    <div class="title">BOT CONFIGURATION (V7)</div>
+    <div class="row"><span>Status:</span><span id="status" style="color:red">STOPPED</span></div>
+
+    <div class="row">
+      <span>Strategy Mode</span>
+      <select id="mode">
+        <option>Both (1 & 2)</option>
+      </select>
+    </div>
+
+    <div class="title">1. STF CONFIRMATION</div>
+    <div class="row"><span>TF 1</span><select id="stf1"><option>1m</option><option>5m</option></select></div>
+    <div class="row"><span>TF 2</span><select id="stf2"><option>5m</option><option>15m</option></select></div>
+
+    <div class="title">2. LTF CONFIRMATION</div>
+    <div class="row"><span>TF 1</span><select id="ltf1"><option>1h</option><option>4h</option></select></div>
+    <div class="row"><span>TF 2</span><select id="ltf2"><option>1h</option><option>4h</option></select></div>
+
+    <div class="row"><span>Bot Qty</span><input id="qty" value="0.1"></div>
+    <button class="green" onclick="startBot()">START BOT</button>
+  </div>
+
+  <div class="section">
+    <div class="title">MANUAL OVERRIDE</div>
+    <button class="green">BUY / LONG</button>
+    <button class="red">SELL / SHORT</button>
+    <button class="orange">CLOSE ALL</button>
+  </div>
+
+</div>
+
+<!-- ================= MAIN CHART AREA ================= -->
+<div class="main">
+
+  <!-- 4 PRICE CHARTS -->
+  <div class="grid4">
+    <div class="chart-box"><div class="chart-label">STF TF-1</div><div id="c1" class="chart"></div></div>
+    <div class="chart-box"><div class="chart-label">STF TF-2</div><div id="c2" class="chart"></div></div>
+    <div class="chart-box"><div class="chart-label">LTF TF-1</div><div id="c3" class="chart"></div></div>
+    <div class="chart-box"><div class="chart-label">LTF TF-2</div><div id="c4" class="chart"></div></div>
+  </div>
+
+  <!-- RSI CHARTS -->
+  <div class="grid2">
+    <div class="chart-box"><div class="chart-label">STF RSI (TF1 vs TF2)</div><div id="rsi1" class="chart"></div></div>
+    <div class="chart-box"><div class="chart-label">LTF RSI (TF1 vs TF2)</div><div id="rsi2" class="chart"></div></div>
+  </div>
+
+</div>
+
+<script>
+axios.defaults.baseURL="http://localhost:8000";
+
+/* ---------- CHART CREATION ---------- */
+function mkChart(id){
+  return LightweightCharts.createChart(
+    document.getElementById(id),
+    {layout:{backgroundColor:'#000',textColor:'#ccc'},timeScale:{timeVisible:true}}
+  )
+}
+const charts={
+  c1:mkChart('c1'),c2:mkChart('c2'),c3:mkChart('c3'),c4:mkChart('c4')
+}
+const candles={
+  c1:charts.c1.addCandlestickSeries(),
+  c2:charts.c2.addCandlestickSeries(),
+  c3:charts.c3.addCandlestickSeries(),
+  c4:charts.c4.addCandlestickSeries()
 }
 
-BOT_STATE = {
-    "running": False,
-    "htf_signal": "WAIT",
-    "wallet_balance": 1000.0,
-    "position": None,      # None, "LONG", or "SHORT"
-    "entry_price": 0.0,
-    "pos_size": 0.0,
-    "trades": []
+const rsi1=mkChart('rsi1'),rsi2=mkChart('rsi2');
+const rsi1a=rsi1.addLineSeries({color:'#22d3ee'});
+const rsi1b=rsi1.addLineSeries({color:'#f59e0b'});
+const rsi2a=rsi2.addLineSeries({color:'#a855f7'});
+const rsi2b=rsi2.addLineSeries({color:'#f59e0b'});
+
+/* ---------- RSI CROSS LOGIC ---------- */
+function rsiCross(a,b){
+  let m=[];
+  for(let i=1;i<Math.min(a.length,b.length);i++){
+    let p=a[i-1].value-b[i-1].value;
+    let c=a[i].value-b[i].value;
+    if(p<0&&c>0) m.push({time:a[i].time,shape:'diamond',color:'#22c55e',position:'inBar'});
+    if(p>0&&c<0) m.push({time:a[i].time,shape:'diamond',color:'#ef4444',position:'inBar'});
+  }
+  return m;
 }
 
-# --- HELPER FUNCTIONS ---
-def get_rsi_value(symbol, timeframe, length=14):
-    """Fetches candles and calculates the latest RSI value."""
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        if not ohlcv: return 50
-        df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-        df['rsi'] = ta.rsi(df['close'], length=length)
-        if pd.isna(df['rsi'].iloc[-1]): return 50
-        return float(df['rsi'].iloc[-1])
-    except Exception as e:
-        print(f"[Data Error] {timeframe}: {e}")
-        return 50
-
-def get_current_price(symbol):
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        return float(ticker['last'])
-    except:
-        return 0.0
-
-def execute_trade(side, order_type, qty, price, reason="BOT"):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-
-    # 1. Close Opposite Position if exists
-    if BOT_STATE["position"]:
-        if (BOT_STATE["position"] == "LONG" and side == "SELL") or \
-           (BOT_STATE["position"] == "SHORT" and side == "BUY"):
-            close_position(price)
-
-    # 2. Open New Position
-    if BOT_STATE["position"] is None:
-        BOT_STATE["position"] = "LONG" if side == "BUY" else "SHORT"
-        BOT_STATE["entry_price"] = price
-        BOT_STATE["pos_size"] = qty
-        
-        log_entry = {
-            "time": timestamp,
-            "side": side,
-            "type": reason,
-            "price": price,
-            "pnl": 0.0
-        }
-        BOT_STATE["trades"].insert(0, log_entry)
-        print(f"[{timestamp}] OPEN {side} @ {price}")
-
-def close_position(price):
-    if not BOT_STATE["position"]: return
-
-    qty = BOT_STATE["pos_size"]
-    entry = BOT_STATE["entry_price"]
-    is_long = BOT_STATE["position"] == "LONG"
-    
-    # Calculate PnL
-    diff = price - entry
-    if not is_long: diff = -diff
-    pnl = diff * qty
-
-    BOT_STATE["wallet_balance"] += pnl
-    
-    log_entry = {
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "side": "SELL" if is_long else "BUY",
-        "type": "CLOSE",
-        "price": price,
-        "pnl": round(pnl, 2)
+/* ---------- UPDATE LOOP ---------- */
+async function update(){
+  const res=await axios.get('/api/market',{
+    params:{
+      stf1:stf1.value,stf2:stf2.value,
+      ltf1:ltf1.value,ltf2:ltf2.value
     }
-    BOT_STATE["trades"].insert(0, log_entry)
-    
-    BOT_STATE["position"] = None
-    BOT_STATE["entry_price"] = 0.0
-    BOT_STATE["pos_size"] = 0.0
-    print(f"Closed Position. PnL: {pnl:.2f}")
+  });
+  const d=res.data;
 
-# --- BOT LOGIC LOOP ---
-def bot_logic_loop():
-    print("--- Bot Loop Thread Started ---")
-    while True:
-        if BOT_STATE["running"]:
-            try:
-                sym = BOT_CONFIG["symbol"]
-                price = get_current_price(sym)
-                
-                # Fetch RSI values
-                rh_f = get_rsi_value(sym, BOT_CONFIG["htf_fast"])
-                rh_s = get_rsi_value(sym, BOT_CONFIG["htf_slow"])
-                rl_f = get_rsi_value(sym, BOT_CONFIG["ltf_fast"])
-                rl_s = get_rsi_value(sym, BOT_CONFIG["ltf_slow"])
-                
-                # Determine Signals
-                htf_bull = rh_f > rh_s
-                ltf_bull = rl_f > rl_s
-                
-                BOT_STATE["htf_signal"] = "UP (Bullish)" if htf_bull else "DOWN (Bearish)"
+  document.getElementById('wallet').innerText=d.state.wallet.toFixed(2);
+  document.getElementById('botPnl').innerText=d.state.unrealized.toFixed(2);
+  document.getElementById('price').innerText=d.price.toFixed(2);
+  document.getElementById('time').innerText=new Date().toLocaleTimeString('en-US',{hour12:true});
 
-                # Execution Logic
-                # BUY: HTF Bull + LTF Bull + No Position
-                if htf_bull and ltf_bull:
-                    if BOT_STATE["position"] is None:
-                        execute_trade("BUY", "MARKET", BOT_CONFIG["bot_qty"], price, "SIGNAL")
-                    elif BOT_STATE["position"] == "SHORT":
-                        close_position(price)
+  candles.c1.setData(d.stf1.map(x=>x));
+  candles.c2.setData(d.stf2.map(x=>x));
+  candles.c3.setData(d.ltf1.map(x=>x));
+  candles.c4.setData(d.ltf2.map(x=>x));
 
-                # SELL: HTF Bear + LTF Bear + No Position
-                elif not htf_bull and not ltf_bull:
-                    if BOT_STATE["position"] is None:
-                        execute_trade("SELL", "MARKET", BOT_CONFIG["bot_qty"], price, "SIGNAL")
-                    elif BOT_STATE["position"] == "LONG":
-                        close_position(price)
+  const s1=d.stf1.map(x=>({time:x.time,value:x.rsi}));
+  const s2=d.stf2.map(x=>({time:x.time,value:x.rsi}));
+  rsi1a.setData(s1); rsi1b.setData(s2);
+  rsi1a.setMarkers(rsiCross(s1,s2));
 
-            except Exception as e:
-                print(f"Loop Logic Error: {e}")
-        
-        time.sleep(2) # Check every 2 seconds
+  const l1=d.ltf1.map(x=>({time:x.time,value:x.rsi}));
+  const l2=d.ltf2.map(x=>({time:x.time,value:x.rsi}));
+  rsi2a.setData(l1); rsi2b.setData(l2);
+  rsi2a.setMarkers(rsiCross(l1,l2));
+}
 
-# Start the background thread
-t = threading.Thread(target=bot_logic_loop, daemon=True)
-t.start()
+setInterval(update,2000);
+update();
 
-# --- API ENDPOINTS ---
-@app.get("/")
-def index():
-    return {"status": "Bot Backend Running"}
+function startBot(){
+  axios.post('/api/start');
+  status.innerText='RUNNING';
+  status.style.color='lime';
+}
+</script>
 
-@app.get("/bot/status")
-def get_status():
-    return {
-        "config": BOT_CONFIG,
-        "state": {
-            "running": BOT_STATE["running"],
-            "htf_signal": BOT_STATE["htf_signal"],
-            "position": BOT_STATE["position"],
-            "wallet": BOT_STATE["wallet_balance"],
-            "trades": BOT_STATE["trades"][:50]
-        }
-    }
-
-@app.post("/bot/start")
-def start_bot():
-    BOT_STATE["running"] = True
-    return {"status": "started"}
-
-@app.post("/bot/stop")
-def stop_bot():
-    BOT_STATE["running"] = False
-    return {"status": "stopped"}
-
-@app.post("/bot/config")
-async def update_config(req: Request):
-    data = await req.json()
-    BOT_CONFIG.update(data)
-    return {"status": "updated", "config": BOT_CONFIG}
-
-@app.post("/bot/manual")
-async def manual_trade(req: Request):
-    data = await req.json()
-    side = data.get("side")
-    qty = float(data.get("qty", 0.001))
-    price = float(data.get("price", 0) or get_current_price(BOT_CONFIG["symbol"]))
-    execute_trade(side, "MARKET", qty, price, "MANUAL")
-    return {"status": "executed"}
-
-if __name__ == "__main__":
-    # RAILWAY CONFIGURATION
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+</body>
+</html>
