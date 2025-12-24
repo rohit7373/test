@@ -5,6 +5,7 @@ import ccxt
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional  # <--- ADDED THIS IMPORT
 from datetime import datetime
 import uvicorn
 
@@ -22,13 +23,12 @@ exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
 
 # --- STATE MANAGEMENT ---
-# Updated to support multiple open trades and history
 STATE = {
     "running": False,
     "wallet": 1000.0,
-    "unrealized": 0.0, # Total Unrealized PnL of all trades
-    "openTrades": [],  # List of active positions
-    "history": []      # List of closed trades
+    "unrealized": 0.0, 
+    "openTrades": [],  
+    "history": []      
 }
 
 TF_MAP = {
@@ -42,13 +42,14 @@ CACHE = {
     "data": None
 }
 
-# --- DATA MODELS (Fixes Manual Override Errors) ---
+# --- DATA MODELS (FIXED) ---
 class ManualOrder(BaseModel):
     side: str
     qty: float
     type: str
-    sl: float = None
-    tp: float = None
+    # "Optional[float]" tells Python it is okay if these are null/empty
+    sl: Optional[float] = None 
+    tp: Optional[float] = None
 
 class CloseTradeReq(BaseModel):
     id: str
@@ -90,7 +91,7 @@ def bot_loop():
             
             STATE["unrealized"] = total_unrealized
 
-            # 2. Automated Strategy Logic (Only if Running)
+            # 2. Automated Strategy Logic
             if STATE["running"]:
                 df_f = fetch_candles("1m")
                 df_s = fetch_candles("5m")
@@ -99,8 +100,7 @@ def bot_loop():
                     rsi_f = df_f["rsi"].iloc[-1]
                     rsi_s = df_s["rsi"].iloc[-1]
 
-                    # Simple Logic Example (Add your complex logic here)
-                    # For safety, we only open one auto-trade at a time in this example
+                    # Only open auto-trade if none exist
                     has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
                     if not has_auto_trade:
@@ -108,7 +108,7 @@ def bot_loop():
                             new_trade = {
                                 "id": str(uuid.uuid4())[:8],
                                 "side": "LONG",
-                                "size": 0.01, # Default bot size
+                                "size": 0.01,
                                 "entryPrice": current_price,
                                 "sl": None,
                                 "tp": None,
@@ -124,7 +124,6 @@ def bot_loop():
         
         time.sleep(2)
 
-# Start the background thread
 threading.Thread(target=bot_loop, daemon=True).start()
 
 # --- API ENDPOINTS ---
@@ -133,7 +132,7 @@ threading.Thread(target=bot_loop, daemon=True).start()
 def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
     current_time = time.time()
     
-    # Cache Check: Serve old data if request is within 5 seconds
+    # Cache Check
     if CACHE["data"] is not None and (current_time - CACHE["last_update"] < 5):
         return CACHE["data"]
 
@@ -142,7 +141,6 @@ def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
         return df[["time","open","high","low","close","rsi"]].to_dict("records")
         
     try:
-        # Fetch fresh data
         price = last_price()
         CACHE["data"] = {
             "price": price,
@@ -158,7 +156,7 @@ def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
         return CACHE["data"]
     except Exception as e:
         print(f"Market Data Error: {e}")
-        if CACHE["data"]: return CACHE["data"] # Fallback to old data
+        if CACHE["data"]: return CACHE["data"]
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/start")
@@ -177,7 +175,6 @@ def stop():
 def manual_order(order: ManualOrder):
     price = last_price()
     
-    # Create Trade Object
     trade = {
         "id": str(uuid.uuid4())[:8],
         "side": order.side,
@@ -195,7 +192,6 @@ def manual_order(order: ManualOrder):
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
-    # Find the trade
     trade_to_close = None
     for t in STATE["openTrades"]:
         if t["id"] == req.id:
@@ -205,7 +201,6 @@ def manual_close(req: CloseTradeReq):
     if trade_to_close:
         STATE["openTrades"].remove(trade_to_close)
         
-        # Add to history
         history_item = {
             "time": datetime.now().isoformat(),
             "side": trade_to_close["side"],
@@ -226,7 +221,6 @@ def close_all():
     count = 0
     
     for t in STATE["openTrades"]:
-        # Add to history
         history_item = {
             "time": datetime.now().isoformat(),
             "side": t["side"],
@@ -238,7 +232,7 @@ def close_all():
         STATE["wallet"] += t["pnl"]
         count += 1
         
-    STATE["openTrades"] = [] # Wipe open trades
+    STATE["openTrades"] = []
     return {"status": "success", "closed_count": count}
 
 if __name__ == "__main__":
