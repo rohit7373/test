@@ -108,7 +108,7 @@ def start():
 
 @app.post("/api/stop")
 def stop():
-    STATE["running"] = False
+    STATE["stop"] = False
     return {"ok":True}
 
 if __name__ == "__main__":
