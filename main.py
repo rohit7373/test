@@ -108,7 +108,7 @@ def start():
 
 @app.post("/api/stop")
 def stop():
-    STATE["stop"] = False
+    STATE["stop"] = True
     return {"ok":True}
 
 if __name__ == "__main__":
