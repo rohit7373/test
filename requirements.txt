@@ -1,6 +1,5 @@
-flask
-flask-cors
+fastapi
+uvicorn
 pandas
 pandas_ta
 ccxt
-gunicorn
