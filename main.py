@@ -87,20 +87,35 @@ def bot_loop():
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
+# PASTE THIS NEW VERSION
 @app.get("/api/market")
 def market(stf1:str, stf2:str, ltf1:str, ltf2:str):
-    def pack(df):
-        return df[["time","open","high","low","close","rsi"]].to_dict("records")
+    current_time = time.time()
+    
+    # Check if cache is empty OR if data is older than 10 seconds
+    if CACHE["data"] is None or (current_time - CACHE["last_update"] > 10):
+        def pack(df):
+            return df[["time","open","high","low","close","rsi"]].to_dict("records")
+            
+        try:
+            # Fetch fresh data from Binance
+            CACHE["data"] = {
+                "price": last_price(),
+                "stf1": pack(fetch_candles(stf1)),
+                "stf2": pack(fetch_candles(stf2)),
+                "ltf1": pack(fetch_candles(ltf1)),
+                "ltf2": pack(fetch_candles(ltf2)),
+                "state": STATE
+            }
+            CACHE["last_update"] = current_time
+        except Exception as e:
+            print(f"Rate limit warning: {e}")
+            # If Binance errors out, send the old cached data instead of crashing
+            if CACHE["data"]: 
+                return CACHE["data"]
+            raise e
 
-    return {
-        "price": last_price(),
-        "stf1": pack(fetch_candles(stf1)),
-        "stf2": pack(fetch_candles(stf2)),
-        "ltf1": pack(fetch_candles(ltf1)),
-        "ltf2": pack(fetch_candles(ltf2)),
-        "state": STATE
-    }
-
+    return CACHE["data"]
 @app.post("/api/start")
 def start():
     STATE["running"] = True
