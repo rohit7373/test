@@ -1,11 +1,11 @@
-import os, time, threading, uuid
+import os, time, threading, uuid, json
 import pandas as pd
 import pandas_ta as ta
 import ccxt
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional  # <--- ADDED THIS IMPORT
+from typing import Optional
 from datetime import datetime
 import uvicorn
 
@@ -21,15 +21,47 @@ app.add_middleware(
 # --- CONFIGURATION ---
 exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
+DATA_FILE = "bot_data.json"  # File to save history
 
 # --- STATE MANAGEMENT ---
 STATE = {
     "running": False,
     "wallet": 1000.0,
-    "unrealized": 0.0, 
-    "openTrades": [],  
-    "history": []      
+    "unrealized": 0.0,
+    "openTrades": [],
+    "history": []
 }
+
+# --- PERSISTENCE FUNCTIONS (SAVE/LOAD) ---
+def save_state():
+    """Saves the current STATE to a JSON file."""
+    try:
+        # We don't save 'unrealized' as it's calculated live
+        data_to_save = {
+            "running": STATE["running"],
+            "wallet": STATE["wallet"],
+            "openTrades": STATE["openTrades"],
+            "history": STATE["history"]
+        }
+        with open(DATA_FILE, "w") as f:
+            json.dump(data_to_save, f, indent=4)
+    except Exception as e:
+        print(f"Error saving data: {e}")
+
+def load_state():
+    """Loads STATE from the JSON file on startup."""
+    global STATE
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                loaded = json.load(f)
+                STATE.update(loaded)
+                print("✅ Previous Trade Data Loaded!")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+
+# Load data immediately on startup
+load_state()
 
 TF_MAP = {
     "1m":"1m","3m":"3m","5m":"5m","15m":"15m",
@@ -42,13 +74,12 @@ CACHE = {
     "data": None
 }
 
-# --- DATA MODELS (FIXED) ---
+# --- DATA MODELS ---
 class ManualOrder(BaseModel):
     side: str
     qty: float
     type: str
-    # "Optional[float]" tells Python it is okay if these are null/empty
-    sl: Optional[float] = None 
+    sl: Optional[float] = None
     tp: Optional[float] = None
 
 class CloseTradeReq(BaseModel):
@@ -74,7 +105,7 @@ def last_price():
     except:
         return 0.0
 
-# --- BACKGROUND BOT LOOP (WITH LTF TREND FILTER) ---
+# --- BACKGROUND BOT LOOP ---
 def bot_loop():
     while True:
         try:
@@ -93,77 +124,60 @@ def bot_loop():
 
             # 2. Automated Strategy Logic
             if STATE["running"]:
-                # --- A. FETCH ALL DATA ---
-                # STF (Triggers): 1m vs 5m
-                df_stf_f = fetch_candles("1m") # Fast (1m)
-                df_stf_s = fetch_candles("5m") # Slow (5m)
+                # Fetch Data
+                df_stf_f = fetch_candles("1m")
+                df_stf_s = fetch_candles("5m")
+                df_ltf_f = fetch_candles("1h")
+                df_ltf_s = fetch_candles("4h")
                 
-                # LTF (Trend Filter): 1h vs 4h
-                df_ltf_f = fetch_candles("1h") # Fast Trend (1h)
-                df_ltf_s = fetch_candles("4h") # Slow Trend (4h)
-                
-                # Ensure we have enough data
                 if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and 
                     not df_ltf_f.empty and not df_ltf_s.empty):
                     
-                    # --- B. DEFINE VARIABLES ---
-                    
-                    # STF Values (For Crossover Trigger)
+                    # Values
                     stf_f_curr = df_stf_f["rsi"].iloc[-1]
                     stf_s_curr = df_stf_s["rsi"].iloc[-1]
                     stf_f_prev = df_stf_f["rsi"].iloc[-2]
                     stf_s_prev = df_stf_s["rsi"].iloc[-2]
                     
-                    # LTF Values (For Trend Filter)
                     ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
                     ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
                     
-                    # --- C. DETERMINE TREND (LTF) ---
-                    # If 1H RSI is above 4H RSI, the broad trend is Bullish
+                    # Trend Filters
                     is_bullish_trend = ltf_f_curr > ltf_s_curr
                     is_bearish_trend = ltf_f_curr < ltf_s_curr
                     
-                    # Check if we already have an auto-trade
                     has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
                     if not has_auto_trade:
-                        
-                        # --- D. EXECUTE LOGIC ---
-                        
-                        # SCENARIO 1: BULLISH TREND + BULLISH CROSS
-                        # Filter: Is LTF Bullish? (YES)
-                        # Trigger: Did STF Cross UP? (YES)
+                        # LONG Logic
                         if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
-                            print(f"TREND ALIGNED LONG! LTF(1h>4h) + STF(CrossUp)")
-                            open_trade("LONG", current_price)
+                            print("AUTO LONG")
+                            open_trade_internal("LONG", current_price, 0.01, True)
 
-                        # SCENARIO 2: BEARISH TREND + BEARISH CROSS
-                        # Filter: Is LTF Bearish? (YES)
-                        # Trigger: Did STF Cross DOWN? (YES)
+                        # SHORT Logic
                         elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
-                            print(f"TREND ALIGNED SHORT! LTF(1h<4h) + STF(CrossDown)")
-                            open_trade("SHORT", current_price)
-                        
-                        # Note: If Trend is Bullish but STF crosses DOWN, we do NOTHING.
-                        # This ignores "Counter-Trend" signals.
+                            print("AUTO SHORT")
+                            open_trade_internal("SHORT", current_price, 0.01, True)
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
         
         time.sleep(2)
 
-# Helper to keep code clean
-def open_trade(side, price):
+# Helper to open trade and SAVE
+def open_trade_internal(side, price, qty, is_auto=False):
     new_trade = {
         "id": str(uuid.uuid4())[:8],
         "side": side,
-        "size": 0.01,
+        "size": qty,
         "entryPrice": price,
         "sl": None, "tp": None, "pnl": 0.0,
-        "auto": True,
+        "auto": is_auto,
         "time": datetime.now().isoformat()
     }
     STATE["openTrades"].append(new_trade)
+    save_state() # <--- SAVE ON NEW TRADE
+
 threading.Thread(target=bot_loop, daemon=True).start()
 
 # --- API ENDPOINTS ---
@@ -171,8 +185,6 @@ threading.Thread(target=bot_loop, daemon=True).start()
 @app.get("/api/market")
 def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
     current_time = time.time()
-    
-    # Cache Check
     if CACHE["data"] is not None and (current_time - CACHE["last_update"] < 5):
         return CACHE["data"]
 
@@ -202,14 +214,14 @@ def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
 @app.post("/api/start")
 def start():
     STATE["running"] = True
+    save_state() # Save running state
     return {"status": "started"}
 
 @app.post("/api/stop")
 def stop():
     STATE["running"] = False
+    save_state() # Save running state
     return {"status": "stopped"}
-
-# --- MANUAL TRADE ENDPOINTS ---
 
 @app.post("/api/manual/order")
 def manual_order(order: ManualOrder):
@@ -223,11 +235,13 @@ def manual_order(order: ManualOrder):
         "sl": order.sl,
         "tp": order.tp,
         "pnl": 0.0,
+        "auto": False,
         "time": datetime.now().isoformat()
     }
     
     STATE["openTrades"].append(trade)
     print(f"Manual Trade Opened: {trade}")
+    save_state() # <--- SAVE DATA
     return {"status": "success", "trade": trade}
 
 @app.post("/api/manual/close")
@@ -251,6 +265,7 @@ def manual_close(req: CloseTradeReq):
         STATE["history"].append(history_item)
         STATE["wallet"] += trade_to_close["pnl"]
         
+        save_state() # <--- SAVE DATA
         return {"status": "success", "message": "Trade closed"}
     
     raise HTTPException(status_code=404, detail="Trade not found")
@@ -273,6 +288,7 @@ def close_all():
         count += 1
         
     STATE["openTrades"] = []
+    save_state() # <--- SAVE DATA
     return {"status": "success", "closed_count": count}
 
 if __name__ == "__main__":
