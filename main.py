@@ -21,7 +21,12 @@ app.add_middleware(
 # --- CONFIGURATION ---
 exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
-DATA_FILE = "bot_data.json"  # File to save history
+DATA_FILE = "bot_data.json"
+
+# --- STRATEGY SETTINGS (NEW) ---
+# 0.01 = 1%, 0.02 = 2%
+STOP_LOSS_PCT = 0.01   
+TAKE_PROFIT_PCT = 0.02 
 
 # --- STATE MANAGEMENT ---
 STATE = {
@@ -32,11 +37,9 @@ STATE = {
     "history": []
 }
 
-# --- PERSISTENCE FUNCTIONS (SAVE/LOAD) ---
+# --- PERSISTENCE FUNCTIONS ---
 def save_state():
-    """Saves the current STATE to a JSON file."""
     try:
-        # We don't save 'unrealized' as it's calculated live
         data_to_save = {
             "running": STATE["running"],
             "wallet": STATE["wallet"],
@@ -49,7 +52,6 @@ def save_state():
         print(f"Error saving data: {e}")
 
 def load_state():
-    """Loads STATE from the JSON file on startup."""
     global STATE
     try:
         if os.path.exists(DATA_FILE):
@@ -60,7 +62,6 @@ def load_state():
     except Exception as e:
         print(f"Error loading data: {e}")
 
-# Load data immediately on startup
 load_state()
 
 TF_MAP = {
@@ -68,11 +69,7 @@ TF_MAP = {
     "1h":"1h","4h":"4h","1d":"1d","1w":"1w"
 }
 
-# --- CACHING SYSTEM ---
-CACHE = {
-    "last_update": 0,
-    "data": None
-}
+CACHE = { "last_update": 0, "data": None }
 
 # --- DATA MODELS ---
 class ManualOrder(BaseModel):
@@ -105,26 +102,69 @@ def last_price():
     except:
         return 0.0
 
+def close_trade_internal(trade, current_price, reason):
+    """Closes a specific trade and saves state."""
+    STATE["openTrades"].remove(trade)
+    
+    # Calculate Final PnL
+    diff = current_price - trade["entryPrice"]
+    if trade["side"] == "SHORT":
+        diff = -diff
+    final_pnl = diff * trade["size"]
+
+    history_item = {
+        "time": datetime.now().isoformat(),
+        "side": trade["side"],
+        "price": current_price,
+        "qty": trade["size"],
+        "realizedPnl": final_pnl,
+        "reason": reason # e.g., "TP Hit", "SL Hit", "Manual"
+    }
+    STATE["history"].append(history_item)
+    STATE["wallet"] += final_pnl
+    save_state()
+    print(f"🚫 Trade Closed ({reason}): {final_pnl:.2f}")
+
 # --- BACKGROUND BOT LOOP ---
 def bot_loop():
     while True:
         try:
             current_price = last_price()
             
-            # 1. Update PnL for Open Trades
+            # --- 1. MONITOR OPEN TRADES (SL/TP CHECK) ---
             total_unrealized = 0.0
+            trades_to_close = []
+
             for trade in STATE["openTrades"]:
+                # Update PnL
                 diff = current_price - trade["entryPrice"]
                 if trade["side"] == "SHORT":
                     diff = -diff
                 trade["pnl"] = diff * trade["size"]
                 total_unrealized += trade["pnl"]
+
+                # Check SL / TP
+                if trade["sl"] and trade["tp"]:
+                    if trade["side"] == "LONG":
+                        if current_price <= trade["sl"]:
+                            trades_to_close.append((trade, "SL Hit"))
+                        elif current_price >= trade["tp"]:
+                            trades_to_close.append((trade, "TP Hit"))
+                    
+                    elif trade["side"] == "SHORT":
+                        if current_price >= trade["sl"]:
+                            trades_to_close.append((trade, "SL Hit"))
+                        elif current_price <= trade["tp"]:
+                            trades_to_close.append((trade, "TP Hit"))
+            
+            # Close flagged trades
+            for t, reason in trades_to_close:
+                close_trade_internal(t, current_price, reason)
             
             STATE["unrealized"] = total_unrealized
 
-            # 2. Automated Strategy Logic
+            # --- 2. AUTOMATED STRATEGY LOGIC ---
             if STATE["running"]:
-                # Fetch Data
                 df_stf_f = fetch_candles("1m")
                 df_stf_s = fetch_candles("5m")
                 df_ltf_f = fetch_candles("1h")
@@ -133,7 +173,6 @@ def bot_loop():
                 if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and 
                     not df_ltf_f.empty and not df_ltf_s.empty):
                     
-                    # Values
                     stf_f_curr = df_stf_f["rsi"].iloc[-1]
                     stf_s_curr = df_stf_s["rsi"].iloc[-1]
                     stf_f_prev = df_stf_f["rsi"].iloc[-2]
@@ -142,41 +181,47 @@ def bot_loop():
                     ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
                     ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
                     
-                    # Trend Filters
                     is_bullish_trend = ltf_f_curr > ltf_s_curr
                     is_bearish_trend = ltf_f_curr < ltf_s_curr
                     
                     has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
                     if not has_auto_trade:
-                        # LONG Logic
+                        # LONG ENTRY
                         if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
-                            print("AUTO LONG")
-                            open_trade_internal("LONG", current_price, 0.01, True)
+                            print("🚀 AUTO LONG SIGNAL")
+                            # Calculate SL/TP for LONG
+                            sl_price = current_price * (1 - STOP_LOSS_PCT)
+                            tp_price = current_price * (1 + TAKE_PROFIT_PCT)
+                            open_trade_internal("LONG", current_price, 0.01, sl_price, tp_price, True)
 
-                        # SHORT Logic
+                        # SHORT ENTRY
                         elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
-                            print("AUTO SHORT")
-                            open_trade_internal("SHORT", current_price, 0.01, True)
+                            print("🚀 AUTO SHORT SIGNAL")
+                            # Calculate SL/TP for SHORT
+                            sl_price = current_price * (1 + STOP_LOSS_PCT)
+                            tp_price = current_price * (1 - TAKE_PROFIT_PCT)
+                            open_trade_internal("SHORT", current_price, 0.01, sl_price, tp_price, True)
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
         
         time.sleep(2)
 
-# Helper to open trade and SAVE
-def open_trade_internal(side, price, qty, is_auto=False):
+def open_trade_internal(side, price, qty, sl, tp, is_auto=False):
     new_trade = {
         "id": str(uuid.uuid4())[:8],
         "side": side,
         "size": qty,
         "entryPrice": price,
-        "sl": None, "tp": None, "pnl": 0.0,
+        "sl": sl, 
+        "tp": tp, 
+        "pnl": 0.0,
         "auto": is_auto,
         "time": datetime.now().isoformat()
     }
     STATE["openTrades"].append(new_trade)
-    save_state() # <--- SAVE ON NEW TRADE
+    save_state()
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
@@ -214,13 +259,13 @@ def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
 @app.post("/api/start")
 def start():
     STATE["running"] = True
-    save_state() # Save running state
+    save_state()
     return {"status": "started"}
 
 @app.post("/api/stop")
 def stop():
     STATE["running"] = False
-    save_state() # Save running state
+    save_state()
     return {"status": "stopped"}
 
 @app.post("/api/manual/order")
@@ -232,8 +277,8 @@ def manual_order(order: ManualOrder):
         "side": order.side,
         "size": order.qty,
         "entryPrice": price,
-        "sl": order.sl,
-        "tp": order.tp,
+        "sl": order.sl, # Uses the manual input
+        "tp": order.tp, # Uses the manual input
         "pnl": 0.0,
         "auto": False,
         "time": datetime.now().isoformat()
@@ -241,11 +286,12 @@ def manual_order(order: ManualOrder):
     
     STATE["openTrades"].append(trade)
     print(f"Manual Trade Opened: {trade}")
-    save_state() # <--- SAVE DATA
+    save_state()
     return {"status": "success", "trade": trade}
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
+    price = last_price()
     trade_to_close = None
     for t in STATE["openTrades"]:
         if t["id"] == req.id:
@@ -253,19 +299,7 @@ def manual_close(req: CloseTradeReq):
             break
             
     if trade_to_close:
-        STATE["openTrades"].remove(trade_to_close)
-        
-        history_item = {
-            "time": datetime.now().isoformat(),
-            "side": trade_to_close["side"],
-            "price": last_price(),
-            "qty": trade_to_close["size"],
-            "realizedPnl": trade_to_close["pnl"]
-        }
-        STATE["history"].append(history_item)
-        STATE["wallet"] += trade_to_close["pnl"]
-        
-        save_state() # <--- SAVE DATA
+        close_trade_internal(trade_to_close, price, "Manual Close")
         return {"status": "success", "message": "Trade closed"}
     
     raise HTTPException(status_code=404, detail="Trade not found")
@@ -273,22 +307,12 @@ def manual_close(req: CloseTradeReq):
 @app.post("/api/manual/close-all")
 def close_all():
     current_p = last_price()
-    count = 0
+    count = len(STATE["openTrades"])
     
-    for t in STATE["openTrades"]:
-        history_item = {
-            "time": datetime.now().isoformat(),
-            "side": t["side"],
-            "price": current_p,
-            "qty": t["size"],
-            "realizedPnl": t["pnl"]
-        }
-        STATE["history"].append(history_item)
-        STATE["wallet"] += t["pnl"]
-        count += 1
+    # Create a copy of the list to iterate safely while modifying
+    for t in list(STATE["openTrades"]):
+        close_trade_internal(t, current_p, "Manual Close All")
         
-    STATE["openTrades"] = []
-    save_state() # <--- SAVE DATA
     return {"status": "success", "closed_count": count}
 
 if __name__ == "__main__":
