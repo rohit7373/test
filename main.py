@@ -23,10 +23,10 @@ exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
 DATA_FILE = "bot_data.json"
 
-# --- STRATEGY SETTINGS (NEW) ---
-# 0.01 = 1%, 0.02 = 2%
-STOP_LOSS_PCT = 0.01   
-TAKE_PROFIT_PCT = 0.02 
+# --- FEE & STRATEGY SETTINGS ---
+FEE_RATE = 0.00025   # 0.025% Fee
+TARGET_NET_PROFIT = 0.004 # 0.4% Actual Profit
+MAX_NET_LOSS = 0.003      # 0.3% Actual Loss
 
 # --- STATE MANAGEMENT ---
 STATE = {
@@ -37,7 +37,7 @@ STATE = {
     "history": []
 }
 
-# --- PERSISTENCE FUNCTIONS ---
+# --- PERSISTENCE ---
 def save_state():
     try:
         data_to_save = {
@@ -58,7 +58,7 @@ def load_state():
             with open(DATA_FILE, "r") as f:
                 loaded = json.load(f)
                 STATE.update(loaded)
-                print("✅ Previous Trade Data Loaded!")
+                print("✅ Data Loaded Successfully")
     except Exception as e:
         print(f"Error loading data: {e}")
 
@@ -71,7 +71,7 @@ TF_MAP = {
 
 CACHE = { "last_update": 0, "data": None }
 
-# --- DATA MODELS ---
+# --- MODELS ---
 class ManualOrder(BaseModel):
     side: str
     qty: float
@@ -102,68 +102,81 @@ def last_price():
     except:
         return 0.0
 
-def close_trade_internal(trade, current_price, reason):
-    """Closes a specific trade and saves state."""
-    STATE["openTrades"].remove(trade)
+# --- PNL & PRICE CALCULATION LOGIC ---
+
+def calculate_net_pnl(side, entry_price, exit_price, qty):
+    """
+    Calculates ACTUAL PnL after deducting 0.025% fee from both Entry and Exit.
+    """
+    turnover_entry = entry_price * qty
+    turnover_exit = exit_price * qty
     
-    # Calculate Final PnL
-    diff = current_price - trade["entryPrice"]
-    if trade["side"] == "SHORT":
-        diff = -diff
-    final_pnl = diff * trade["size"]
+    fee_entry = turnover_entry * FEE_RATE
+    fee_exit = turnover_exit * FEE_RATE
+    
+    if side == "LONG":
+        gross_pnl = turnover_exit - turnover_entry
+    else: # SHORT
+        gross_pnl = turnover_entry - turnover_exit
+        
+    net_pnl = gross_pnl - fee_entry - fee_exit
+    return net_pnl
 
-    history_item = {
-        "time": datetime.now().isoformat(),
-        "side": trade["side"],
-        "price": current_price,
-        "qty": trade["size"],
-        "realizedPnl": final_pnl,
-        "reason": reason # e.g., "TP Hit", "SL Hit", "Manual"
-    }
-    STATE["history"].append(history_item)
-    STATE["wallet"] += final_pnl
-    save_state()
-    print(f"🚫 Trade Closed ({reason}): {final_pnl:.2f}")
+def calculate_tp_sl_prices(side, entry_price):
+    """
+    Calculates TP/SL prices to ensure ACTUAL Net Profit of 0.4% 
+    and ACTUAL Net Loss of 0.3% after fees.
+    """
+    # Formulas derived to account for fees on both ends:
+    # Net = (Exit - Entry) - (Entry*Fee) - (Exit*Fee)  [simplified]
+    
+    if side == "LONG":
+        # Target TP: Entry * (1 + Fee + Target) / (1 - Fee)
+        tp_price = entry_price * (1 + FEE_RATE + TARGET_NET_PROFIT) / (1 - FEE_RATE)
+        # Target SL: Entry * (1 + Fee - MaxLoss) / (1 - Fee)
+        sl_price = entry_price * (1 + FEE_RATE - MAX_NET_LOSS) / (1 - FEE_RATE)
+        
+    else: # SHORT
+        # Target TP: Entry * (1 - Fee - Target) / (1 + Fee)
+        tp_price = entry_price * (1 - FEE_RATE - TARGET_NET_PROFIT) / (1 + FEE_RATE)
+        # Target SL: Entry * (1 - Fee + MaxLoss) / (1 + Fee)
+        sl_price = entry_price * (1 - FEE_RATE + MAX_NET_LOSS) / (1 + FEE_RATE)
+        
+    return tp_price, sl_price
 
-# --- BACKGROUND BOT LOOP ---
+# --- BOT LOOP ---
 def bot_loop():
     while True:
         try:
-            current_price = last_price()
+            current_p = last_price()
             
-            # --- 1. MONITOR OPEN TRADES (SL/TP CHECK) ---
+            # 1. Update Open Trades PnL & Check TP/SL
             total_unrealized = 0.0
             trades_to_close = []
-
+            
             for trade in STATE["openTrades"]:
-                # Update PnL
-                diff = current_price - trade["entryPrice"]
-                if trade["side"] == "SHORT":
-                    diff = -diff
-                trade["pnl"] = diff * trade["size"]
-                total_unrealized += trade["pnl"]
-
-                # Check SL / TP
-                if trade["sl"] and trade["tp"]:
+                # Calculate Net PnL Live
+                net_pnl = calculate_net_pnl(trade["side"], trade["entryPrice"], current_p, trade["size"])
+                trade["pnl"] = net_pnl
+                total_unrealized += net_pnl
+                
+                # Check Auto-Close Conditions (TP/SL)
+                # Note: We use the pre-calculated TP/SL prices which already account for fees
+                if trade["tp"] and trade["sl"]:
                     if trade["side"] == "LONG":
-                        if current_price <= trade["sl"]:
-                            trades_to_close.append((trade, "SL Hit"))
-                        elif current_price >= trade["tp"]:
-                            trades_to_close.append((trade, "TP Hit"))
-                    
-                    elif trade["side"] == "SHORT":
-                        if current_price >= trade["sl"]:
-                            trades_to_close.append((trade, "SL Hit"))
-                        elif current_price <= trade["tp"]:
-                            trades_to_close.append((trade, "TP Hit"))
-            
-            # Close flagged trades
-            for t, reason in trades_to_close:
-                close_trade_internal(t, current_price, reason)
-            
+                        if current_p >= trade["tp"]: trades_to_close.append((trade, "TP"))
+                        elif current_p <= trade["sl"]: trades_to_close.append((trade, "SL"))
+                    else: # SHORT
+                        if current_p <= trade["tp"]: trades_to_close.append((trade, "TP"))
+                        elif current_p >= trade["sl"]: trades_to_close.append((trade, "SL"))
+
             STATE["unrealized"] = total_unrealized
 
-            # --- 2. AUTOMATED STRATEGY LOGIC ---
+            # Close Hit Trades
+            for t, reason in trades_to_close:
+                close_trade_internal(t["id"], current_p, reason)
+
+            # 2. Strategy Logic
             if STATE["running"]:
                 df_stf_f = fetch_candles("1m")
                 df_stf_s = fetch_candles("5m")
@@ -181,52 +194,72 @@ def bot_loop():
                     ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
                     ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
                     
-                    is_bullish_trend = ltf_f_curr > ltf_s_curr
-                    is_bearish_trend = ltf_f_curr < ltf_s_curr
+                    is_bullish = ltf_f_curr > ltf_s_curr
+                    is_bearish = ltf_f_curr < ltf_s_curr
                     
-                    has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
+                    has_auto = any(t.get('auto', False) for t in STATE["openTrades"])
 
-                    if not has_auto_trade:
-                        # LONG ENTRY
-                        if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
-                            print("🚀 AUTO LONG SIGNAL")
-                            # Calculate SL/TP for LONG
-                            sl_price = current_price * (1 - STOP_LOSS_PCT)
-                            tp_price = current_price * (1 + TAKE_PROFIT_PCT)
-                            open_trade_internal("LONG", current_price, 0.01, sl_price, tp_price, True)
+                    if not has_auto:
+                        if is_bullish and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
+                            print("AUTO LONG TRIGGER")
+                            open_trade_internal("LONG", current_p, 0.01, True)
 
-                        # SHORT ENTRY
-                        elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
-                            print("🚀 AUTO SHORT SIGNAL")
-                            # Calculate SL/TP for SHORT
-                            sl_price = current_price * (1 + STOP_LOSS_PCT)
-                            tp_price = current_price * (1 - TAKE_PROFIT_PCT)
-                            open_trade_internal("SHORT", current_price, 0.01, sl_price, tp_price, True)
+                        elif is_bearish and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
+                            print("AUTO SHORT TRIGGER")
+                            open_trade_internal("SHORT", current_p, 0.01, True)
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
         
         time.sleep(2)
 
-def open_trade_internal(side, price, qty, sl, tp, is_auto=False):
+def open_trade_internal(side, price, qty, is_auto=False):
+    # Auto-Calculate TP/SL based on User's Net Profit Rules
+    tp_price, sl_price = calculate_tp_sl_prices(side, price)
+    
     new_trade = {
         "id": str(uuid.uuid4())[:8],
         "side": side,
         "size": qty,
         "entryPrice": price,
-        "sl": sl, 
-        "tp": tp, 
-        "pnl": 0.0,
+        "sl": sl_price, 
+        "tp": tp_price, 
+        "pnl": 0.0 - (price * qty * FEE_RATE * 2), # Initial PnL is negative (entry fee + est exit fee)
         "auto": is_auto,
         "time": datetime.now().isoformat()
     }
     STATE["openTrades"].append(new_trade)
     save_state()
 
+def close_trade_internal(trade_id, exit_price, reason="MANUAL"):
+    trade_to_close = None
+    for t in STATE["openTrades"]:
+        if t["id"] == trade_id:
+            trade_to_close = t
+            break
+            
+    if trade_to_close:
+        STATE["openTrades"].remove(trade_to_close)
+        
+        # Calculate Final Net PnL
+        final_pnl = calculate_net_pnl(trade_to_close["side"], trade_to_close["entryPrice"], exit_price, trade_to_close["size"])
+        
+        history_item = {
+            "time": datetime.now().isoformat(),
+            "side": trade_to_close["side"],
+            "price": exit_price,
+            "qty": trade_to_close["size"],
+            "realizedPnl": final_pnl,
+            "reason": reason
+        }
+        STATE["history"].append(history_item)
+        STATE["wallet"] += final_pnl
+        save_state()
+        print(f"Trade Closed ({reason}): PnL {final_pnl:.4f}")
+
 threading.Thread(target=bot_loop, daemon=True).start()
 
-# --- API ENDPOINTS ---
-
+# --- API ---
 @app.get("/api/market")
 def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
     current_time = time.time()
@@ -252,7 +285,6 @@ def market(stf1:str="1m", stf2:str="5m", ltf1:str="1h", ltf2:str="4h"):
         CACHE["last_update"] = current_time
         return CACHE["data"]
     except Exception as e:
-        print(f"Market Data Error: {e}")
         if CACHE["data"]: return CACHE["data"]
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -272,47 +304,48 @@ def stop():
 def manual_order(order: ManualOrder):
     price = last_price()
     
+    # If user provided Manual SL/TP, use them. 
+    # Otherwise, use the Auto-Calc based on 0.4% / 0.3% Logic
+    if order.sl and order.tp:
+        final_sl, final_tp = order.sl, order.tp
+    else:
+        auto_tp, auto_sl = calculate_tp_sl_prices(order.side, price)
+        # Use user's value if provided, else use auto
+        final_tp = order.tp if order.tp else auto_tp
+        final_sl = order.sl if order.sl else auto_sl
+
+    # Initial PnL = Negative (Entry Fee + Estimated Exit Fee)
+    est_fee = (price * order.qty * FEE_RATE) * 2 
+    
     trade = {
         "id": str(uuid.uuid4())[:8],
         "side": order.side,
         "size": order.qty,
         "entryPrice": price,
-        "sl": order.sl, # Uses the manual input
-        "tp": order.tp, # Uses the manual input
-        "pnl": 0.0,
+        "sl": final_sl,
+        "tp": final_tp,
+        "pnl": -est_fee, 
         "auto": False,
         "time": datetime.now().isoformat()
     }
     
     STATE["openTrades"].append(trade)
-    print(f"Manual Trade Opened: {trade}")
     save_state()
     return {"status": "success", "trade": trade}
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
-    price = last_price()
-    trade_to_close = None
-    for t in STATE["openTrades"]:
-        if t["id"] == req.id:
-            trade_to_close = t
-            break
-            
-    if trade_to_close:
-        close_trade_internal(trade_to_close, price, "Manual Close")
-        return {"status": "success", "message": "Trade closed"}
-    
-    raise HTTPException(status_code=404, detail="Trade not found")
+    close_trade_internal(req.id, last_price(), "MANUAL")
+    return {"status": "success"}
 
 @app.post("/api/manual/close-all")
 def close_all():
     current_p = last_price()
-    count = len(STATE["openTrades"])
-    
-    # Create a copy of the list to iterate safely while modifying
+    count = 0
+    # Create a copy to iterate safely while modifying
     for t in list(STATE["openTrades"]):
-        close_trade_internal(t, current_p, "Manual Close All")
-        
+        close_trade_internal(t["id"], current_p, "CLOSE_ALL")
+        count += 1
     return {"status": "success", "closed_count": count}
 
 if __name__ == "__main__":
