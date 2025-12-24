@@ -74,8 +74,7 @@ def last_price():
     except:
         return 0.0
 
-# --- BACKGROUND BOT LOOP ---
-# --- BACKGROUND BOT LOOP (CORRECTED CROSS LOGIC) ---
+# --- BACKGROUND BOT LOOP (WITH LTF TREND FILTER) ---
 def bot_loop():
     while True:
         try:
@@ -94,62 +93,77 @@ def bot_loop():
 
             # 2. Automated Strategy Logic
             if STATE["running"]:
-                # Fetch fresh candles (Fast = 1m, Slow = 5m)
-                df_f = fetch_candles("1m")
-                df_s = fetch_candles("5m")
+                # --- A. FETCH ALL DATA ---
+                # STF (Triggers): 1m vs 5m
+                df_stf_f = fetch_candles("1m") # Fast (1m)
+                df_stf_s = fetch_candles("5m") # Slow (5m)
                 
-                # We need at least 2 candles to check "Previous" vs "Current"
-                if len(df_f) >= 2 and len(df_s) >= 2:
+                # LTF (Trend Filter): 1h vs 4h
+                df_ltf_f = fetch_candles("1h") # Fast Trend (1h)
+                df_ltf_s = fetch_candles("4h") # Slow Trend (4h)
+                
+                # Ensure we have enough data
+                if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and 
+                    not df_ltf_f.empty and not df_ltf_s.empty):
                     
-                    # --- GET DATA POINTS ---
-                    # Current (Most recent closed candle)
-                    curr_f = df_f["rsi"].iloc[-1]
-                    curr_s = df_s["rsi"].iloc[-1]
+                    # --- B. DEFINE VARIABLES ---
                     
-                    # Previous (The candle before the current one)
-                    prev_f = df_f["rsi"].iloc[-2]
-                    prev_s = df_s["rsi"].iloc[-2]
-
-                    # Check if we already have an auto-trade open
+                    # STF Values (For Crossover Trigger)
+                    stf_f_curr = df_stf_f["rsi"].iloc[-1]
+                    stf_s_curr = df_stf_s["rsi"].iloc[-1]
+                    stf_f_prev = df_stf_f["rsi"].iloc[-2]
+                    stf_s_prev = df_stf_s["rsi"].iloc[-2]
+                    
+                    # LTF Values (For Trend Filter)
+                    ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
+                    ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
+                    
+                    # --- C. DETERMINE TREND (LTF) ---
+                    # If 1H RSI is above 4H RSI, the broad trend is Bullish
+                    is_bullish_trend = ltf_f_curr > ltf_s_curr
+                    is_bearish_trend = ltf_f_curr < ltf_s_curr
+                    
+                    # Check if we already have an auto-trade
                     has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
                     if not has_auto_trade:
                         
-                        # --- BUY LOGIC (Green) ---
-                        # Fast was BELOW Slow, NOW Fast is ABOVE Slow
-                        if prev_f <= prev_s and curr_f > curr_s:
-                            print(f"CROSS DETECTED: BUY (Fast {curr_f:.2f} > Slow {curr_s:.2f})")
-                            new_trade = {
-                                "id": str(uuid.uuid4())[:8],
-                                "side": "LONG",
-                                "size": 0.01,
-                                "entryPrice": current_price,
-                                "sl": None, "tp": None, "pnl": 0.0,
-                                "auto": True,
-                                "time": datetime.now().isoformat()
-                            }
-                            STATE["openTrades"].append(new_trade)
+                        # --- D. EXECUTE LOGIC ---
+                        
+                        # SCENARIO 1: BULLISH TREND + BULLISH CROSS
+                        # Filter: Is LTF Bullish? (YES)
+                        # Trigger: Did STF Cross UP? (YES)
+                        if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
+                            print(f"TREND ALIGNED LONG! LTF(1h>4h) + STF(CrossUp)")
+                            open_trade("LONG", current_price)
 
-                        # --- SELL LOGIC (Red) ---
-                        # Fast was ABOVE Slow, NOW Fast is BELOW Slow
-                        elif prev_f >= prev_s and curr_f < curr_s:
-                            print(f"CROSS DETECTED: SELL (Fast {curr_f:.2f} < Slow {curr_s:.2f})")
-                            new_trade = {
-                                "id": str(uuid.uuid4())[:8],
-                                "side": "SHORT",
-                                "size": 0.01,
-                                "entryPrice": current_price,
-                                "sl": None, "tp": None, "pnl": 0.0,
-                                "auto": True,
-                                "time": datetime.now().isoformat()
-                            }
-                            STATE["openTrades"].append(new_trade)
+                        # SCENARIO 2: BEARISH TREND + BEARISH CROSS
+                        # Filter: Is LTF Bearish? (YES)
+                        # Trigger: Did STF Cross DOWN? (YES)
+                        elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
+                            print(f"TREND ALIGNED SHORT! LTF(1h<4h) + STF(CrossDown)")
+                            open_trade("SHORT", current_price)
+                        
+                        # Note: If Trend is Bullish but STF crosses DOWN, we do NOTHING.
+                        # This ignores "Counter-Trend" signals.
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
         
         time.sleep(2)
 
+# Helper to keep code clean
+def open_trade(side, price):
+    new_trade = {
+        "id": str(uuid.uuid4())[:8],
+        "side": side,
+        "size": 0.01,
+        "entryPrice": price,
+        "sl": None, "tp": None, "pnl": 0.0,
+        "auto": True,
+        "time": datetime.now().isoformat()
+    }
+    STATE["openTrades"].append(new_trade)
 threading.Thread(target=bot_loop, daemon=True).start()
 
 # --- API ENDPOINTS ---
