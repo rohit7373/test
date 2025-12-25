@@ -4,3 +4,4 @@ ccxt
 pandas
 pandas-ta
 numpy
+pymongo
