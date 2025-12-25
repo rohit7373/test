@@ -5,3 +5,4 @@ pandas
 pandas-ta
 numpy
 pymongo
+python-dotenv  
