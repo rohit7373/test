@@ -47,6 +47,15 @@ BOT_CONFIG = {
     "fee": 0.1,   "qty": 0.01
 }
 
+# --- HELPER: CLEAN DATA (Fixes Network Error) ---
+def clean_data(data):
+    """Removes _id from MongoDB objects so the API doesn't crash"""
+    if isinstance(data, list):
+        return [clean_data(x) for x in data]
+    if isinstance(data, dict):
+        return {k: clean_data(v) for k, v in data.items() if k != "_id"}
+    return data
+
 # --- DATABASE CONNECTION & LOADING ---
 if not MONGO_URL:
     print("❌ WARNING: MONGO_URL not found. Using in-memory mode (Data lost on restart).")
@@ -61,21 +70,18 @@ else:
         
         print("✅ MongoDB Client Initialized and Connected")
         
-        # 1. LOAD GLOBAL STATE (Wallet, Running Status, AND Config)
+        # 1. LOAD GLOBAL STATE
         saved_state = state_collection.find_one({"_id": "global_state"})
         if saved_state:
             STATE["wallet"] = saved_state.get("wallet", 1000.0)
             STATE["running"] = saved_state.get("running", False)
             
-            # Load Saved Config if it exists
             if "config" in saved_state:
                 saved_config = saved_state["config"]
-                # Update BOT_CONFIG keys only if they exist in saved data
                 for k in BOT_CONFIG:
                     if k in saved_config:
                         BOT_CONFIG[k] = saved_config[k]
         else:
-            # Initialize DB if empty
             state_collection.insert_one({
                 "_id": "global_state", 
                 "wallet": 1000.0, 
@@ -84,17 +90,13 @@ else:
             })
 
         # 2. LOAD OPEN TRADES
-        # This will automatically load 'sl', 'tp', 'fee_rate', 'logic' if they exist in DB
         db_trades = list(trades_collection.find({}))
-        for t in db_trades:
-            if "_id" in t: del t["_id"]
-        STATE["openTrades"] = db_trades
+        # Apply clean_data immediately on load
+        STATE["openTrades"] = clean_data(db_trades)
 
         # 3. LOAD HISTORY
         db_history = list(history_collection.find().sort("time", -1).limit(100))
-        for h in db_history:
-            if "_id" in h: del h["_id"]
-        STATE["history"] = db_history
+        STATE["history"] = clean_data(db_history)
         
         print(f"🔄 State Loaded: Wallet ${STATE['wallet']:.2f}, Trades: {len(STATE['openTrades'])}")
 
@@ -142,7 +144,7 @@ def update_db_state():
             {"$set": {
                 "wallet": STATE["wallet"], 
                 "running": STATE["running"],
-                "config": BOT_CONFIG  # <--- SAVING CONFIGURATION
+                "config": BOT_CONFIG 
             }},
             upsert=True
         )
@@ -172,7 +174,7 @@ def bot_loop():
         try:
             current_price = last_price()
             
-            # 1. Update PnL for Open Trades
+            # 1. Update PnL
             total_unrealized = 0.0
             trades_to_close = []
             
@@ -181,13 +183,10 @@ def bot_loop():
                 if trade["side"] == "SHORT":
                     diff = -diff
                 
-                # Fee calculation
                 fee_cost = (trade["size"] * current_price) * (trade.get("fee_rate", 0.0) / 100)
                 trade["pnl"] = (diff * trade["size"]) - fee_cost
-                
                 total_unrealized += trade["pnl"]
 
-                # Check SL/TP
                 sl = trade.get("sl")
                 tp = trade.get("tp")
                 
@@ -235,13 +234,11 @@ def bot_loop():
                         # LONG
                         if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
                             logic_str = f"{s1_key}>{s2_key} & {l1_key}>{l2_key}"
-                            print(f"OPEN LONG: {logic_str}")
                             open_trade("LONG", current_price, logic_str)
 
                         # SHORT
                         elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
                             logic_str = f"{s1_key}<{s2_key} & {l1_key}<{l2_key}"
-                            print(f"OPEN SHORT: {logic_str}")
                             open_trade("SHORT", current_price, logic_str)
 
         except Exception as e:
@@ -258,7 +255,6 @@ def open_trade(side, price, logic_desc="Manual"):
         "side": side,
         "size": BOT_CONFIG["qty"],
         "entryPrice": price,
-        # SAVING ALL NEW FIELDS TO DB
         "sl": sl, 
         "tp": tp, 
         "fee_rate": BOT_CONFIG["fee"],
@@ -271,24 +267,24 @@ def open_trade(side, price, logic_desc="Manual"):
     STATE["openTrades"].append(new_trade)
     
     if trades_collection:
+        # Use copy() to prevent local dict from getting _id, but we also use clean_data in API to be safe
         trades_collection.insert_one(new_trade.copy())
 
 def close_trade_internal(trade, current_price, reason="Manual"):
     if trade in STATE["openTrades"]:
         STATE["openTrades"].remove(trade)
         
-        # SAVING ALL COLUMNS TO HISTORY DB
         history_item = {
             "time": datetime.now().isoformat(),
             "side": trade["side"],
             "entryPrice": trade["entryPrice"],
-            "exitPrice": current_price,      # Explicit Exit Price
-            "price": current_price,          # Keep 'price' for frontend compatibility
+            "exitPrice": current_price,
+            "price": current_price,
             "qty": trade["size"],
             "realizedPnl": trade["pnl"],
-            "fee_rate": trade.get("fee_rate", 0.0), # Save Fee
-            "sl": trade.get("sl"),           # Save SL
-            "tp": trade.get("tp"),           # Save TP
+            "fee_rate": trade.get("fee_rate", 0.0),
+            "sl": trade.get("sl"),
+            "tp": trade.get("tp"),
             "logic": trade.get("logic", "Manual"),
             "reason": reason
         }
@@ -299,7 +295,7 @@ def close_trade_internal(trade, current_price, reason="Manual"):
         if trades_collection and history_collection:
             trades_collection.delete_one({"id": trade["id"]})
             history_collection.insert_one(history_item.copy())
-            update_db_state() # Save new wallet
+            update_db_state()
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
@@ -327,9 +323,10 @@ def market():
             "ltf1": pack(fetch_candles(l1)),
             "ltf2": pack(fetch_candles(l2)),
             "config": BOT_CONFIG,
-            "state": STATE,
-            "openTrades": STATE["openTrades"],
-            "history": STATE["history"]
+            # FIX: Clean data before sending to frontend
+            "state": clean_data(STATE),
+            "openTrades": clean_data(STATE["openTrades"]),
+            "history": clean_data(STATE["history"])
         }
         CACHE["last_update"] = current_time
         return CACHE["data"]
@@ -340,7 +337,6 @@ def market():
 
 @app.post("/api/start")
 def start(req: BotStartReq):
-    # Update Config from Frontend
     BOT_CONFIG["stf1"] = req.stf1
     BOT_CONFIG["stf2"] = req.stf2
     BOT_CONFIG["ltf1"] = req.ltf1
@@ -351,13 +347,13 @@ def start(req: BotStartReq):
     BOT_CONFIG["tp"]   = req.tp
     
     STATE["running"] = True
-    update_db_state() # Save 'running' AND 'config'
+    update_db_state()
     return {"status": "started", "config": BOT_CONFIG}
 
 @app.post("/api/stop")
 def stop():
     STATE["running"] = False
-    update_db_state() # Save 'stopped'
+    update_db_state()
     return {"status": "stopped"}
 
 @app.post("/api/manual/order")
@@ -370,7 +366,7 @@ def manual_order(order: ManualOrder):
         "entryPrice": price,
         "sl": order.sl,
         "tp": order.tp,
-        "fee_rate": 0.1, # Default manual fee
+        "fee_rate": 0.1,
         "pnl": 0.0,
         "logic": "Manual",
         "time": datetime.now().isoformat()
@@ -380,7 +376,8 @@ def manual_order(order: ManualOrder):
     if trades_collection:
         trades_collection.insert_one(trade.copy())
         
-    return {"status": "success", "trade": trade}
+    # FIX: Clean data here too
+    return {"status": "success", "trade": clean_data(trade)}
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
