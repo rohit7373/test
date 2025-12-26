@@ -9,7 +9,7 @@ from typing import Optional
 from datetime import datetime
 import uvicorn
 from pymongo import MongoClient
-from bson import ObjectId  # <--- CRITICAL IMPORT FOR MONGO ID HANDLING
+from bson import ObjectId
 
 app = FastAPI()
 
@@ -59,7 +59,6 @@ def clean_data(data):
     if isinstance(data, list):
         return [clean_data(x) for x in data]
     if isinstance(data, dict):
-        # Convert _id to str if it exists, otherwise clean value
         return {k: (str(v) if k == "_id" else clean_data(v)) for k, v in data.items()}
     if isinstance(data, ObjectId):
         return str(data)
@@ -75,11 +74,9 @@ else:
     try:
         client = MongoClient(MONGO_URL)
         db = client.trading_bot 
-        
         state_collection = db.state_collection
         trades_collection = db.open_trades
         history_collection = db.history
-        
         print("✅ MongoDB Client Initialized and Connected")
         
         # 1. LOAD GLOBAL STATE
@@ -87,22 +84,16 @@ else:
         if saved_state:
             STATE["wallet"] = saved_state.get("wallet", 1000.0)
             STATE["running"] = saved_state.get("running", False)
-            
             if "config" in saved_state:
                 saved_config = saved_state["config"]
                 for k in BOT_CONFIG:
-                    if k in saved_config:
-                        BOT_CONFIG[k] = saved_config[k]
+                    if k in saved_config: BOT_CONFIG[k] = saved_config[k]
         else:
             state_collection.insert_one({
-                "_id": "global_state", 
-                "wallet": 1000.0, 
-                "running": False,
-                "config": BOT_CONFIG
+                "_id": "global_state", "wallet": 1000.0, "running": False, "config": BOT_CONFIG
             })
 
         # 2. LOAD OPEN TRADES
-        # Use clean_data immediately to strip ObjectIds from the start
         db_trades = list(trades_collection.find({}))
         STATE["openTrades"] = clean_data(db_trades)
 
@@ -121,43 +112,27 @@ TF_MAP = {
     "1d":"1d", "3d":"3d", "1w":"1w"
 }
 
-CACHE = {
-    "last_update": 0,
-    "data": None
-}
+CACHE = {"last_update": 0, "data": None}
 
 # --- DATA MODELS ---
 class ManualOrder(BaseModel):
-    side: str
-    qty: float
-    type: str
-    sl: Optional[float] = None 
-    tp: Optional[float] = None
+    side: str; qty: float; type: str
+    sl: Optional[float] = None; tp: Optional[float] = None
 
 class BotStartReq(BaseModel):
-    stf1: str
-    stf2: str
-    ltf1: str
-    ltf2: str
-    qty: float
-    fee: float = 0.0
-    sl: Optional[float] = None
-    tp: Optional[float] = None
+    stf1: str; stf2: str; ltf1: str; ltf2: str
+    qty: float; fee: float = 0.0
+    sl: Optional[float] = None; tp: Optional[float] = None
 
 class CloseTradeReq(BaseModel):
     id: str
 
 # --- HELPER FUNCTIONS ---
 def update_db_state():
-    """Updates wallet, running status, AND bot configuration in DB"""
     if state_collection:
         state_collection.update_one(
             {"_id": "global_state"},
-            {"$set": {
-                "wallet": STATE["wallet"], 
-                "running": STATE["running"],
-                "config": BOT_CONFIG 
-            }},
+            {"$set": {"wallet": STATE["wallet"], "running": STATE["running"], "config": BOT_CONFIG}},
             upsert=True
         )
 
@@ -168,40 +143,31 @@ def fetch_candles(tf_key, limit=300):
         df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
         df["time"] = (df["time"] / 1000).astype(int)
         df["rsi"] = ta.rsi(df["close"], length=14)
-        # Note: RSI will have NaNs for first 14 rows, clean_data will handle this
         return df
     except Exception as e:
         print(f"Error fetching candles {tf}: {e}")
         return pd.DataFrame()
 
 def last_price():
-    try:
-        return float(exchange.fetch_ticker(SYMBOL)["last"])
-    except:
-        return 0.0
+    try: return float(exchange.fetch_ticker(SYMBOL)["last"])
+    except: return 0.0
 
 # --- BACKGROUND BOT LOOP ---
 def bot_loop():
     while True:
         try:
             current_price = last_price()
-            
-            # 1. Update PnL
             total_unrealized = 0.0
             trades_to_close = []
             
             for trade in STATE["openTrades"]:
                 diff = current_price - trade["entryPrice"]
-                if trade["side"] == "SHORT":
-                    diff = -diff
-                
+                if trade["side"] == "SHORT": diff = -diff
                 fee_cost = (trade["size"] * current_price) * (trade.get("fee_rate", 0.0) / 100)
                 trade["pnl"] = (diff * trade["size"]) - fee_cost
                 total_unrealized += trade["pnl"]
 
-                sl = trade.get("sl")
-                tp = trade.get("tp")
-                
+                sl = trade.get("sl"); tp = trade.get("tp")
                 if trade["side"] == "LONG":
                     if sl and current_price <= sl: trades_to_close.append(trade)
                     if tp and current_price >= tp: trades_to_close.append(trade)
@@ -210,105 +176,54 @@ def bot_loop():
                     if tp and current_price <= tp: trades_to_close.append(trade)
 
             STATE["unrealized"] = total_unrealized
-            
-            # Process Auto Closes
-            for t in trades_to_close:
-                close_trade_internal(t, current_price, reason="TP/SL Hit")
+            for t in trades_to_close: close_trade_internal(t, current_price, reason="TP/SL Hit")
 
-            # 2. Automated Strategy Logic
             if STATE["running"]:
-                s1_key, s2_key = BOT_CONFIG["stf1"], BOT_CONFIG["stf2"]
-                l1_key, l2_key = BOT_CONFIG["ltf1"], BOT_CONFIG["ltf2"]
+                s1, s2 = BOT_CONFIG["stf1"], BOT_CONFIG["stf2"]
+                l1, l2 = BOT_CONFIG["ltf1"], BOT_CONFIG["ltf2"]
+                df_stf_f = fetch_candles(s1); df_stf_s = fetch_candles(s2)
+                df_ltf_f = fetch_candles(l1); df_ltf_s = fetch_candles(l2)
                 
-                df_stf_f = fetch_candles(s1_key)
-                df_stf_s = fetch_candles(s2_key)
-                df_ltf_f = fetch_candles(l1_key)
-                df_ltf_s = fetch_candles(l2_key)
-                
-                if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and 
-                    not df_ltf_f.empty and not df_ltf_s.empty):
-                    
+                if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and not df_ltf_f.empty and not df_ltf_s.empty):
                     try:
-                        stf_f_curr = df_stf_f["rsi"].iloc[-1]
-                        stf_s_curr = df_stf_s["rsi"].iloc[-1]
-                        stf_f_prev = df_stf_f["rsi"].iloc[-2]
-                        stf_s_prev = df_stf_s["rsi"].iloc[-2]
+                        stf_f = df_stf_f["rsi"].iloc[-1]; stf_s = df_stf_s["rsi"].iloc[-1]
+                        stf_f_prev = df_stf_f["rsi"].iloc[-2]; stf_s_prev = df_stf_s["rsi"].iloc[-2]
+                        ltf_f = df_ltf_f["rsi"].iloc[-1]; ltf_s = df_ltf_s["rsi"].iloc[-1]
                         
-                        ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
-                        ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
-                        
-                        # Ensure no NaNs before logic comparison
-                        if not (math.isnan(stf_f_curr) or math.isnan(ltf_f_curr)):
-                            is_bullish_trend = ltf_f_curr > ltf_s_curr
-                            is_bearish_trend = ltf_f_curr < ltf_s_curr
-                            
-                            has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
+                        if not math.isnan(stf_f) and not math.isnan(ltf_f):
+                            is_bull = ltf_f > ltf_s; is_bear = ltf_f < ltf_s
+                            has_auto = any(t.get('auto', False) for t in STATE["openTrades"])
 
-                            if not has_auto_trade:
-                                logic_str = ""
-                                # LONG
-                                if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
-                                    logic_str = f"{s1_key}>{s2_key} & {l1_key}>{l2_key}"
-                                    open_trade("LONG", current_price, logic_str)
-
-                                # SHORT
-                                elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
-                                    logic_str = f"{s1_key}<{s2_key} & {l1_key}<{l2_key}"
-                                    open_trade("SHORT", current_price, logic_str)
-                    except Exception:
-                        pass # Ignore calculation errors in loop
-
-        except Exception as e:
-            print(f"Bot Loop Error: {e}")
-        
+                            if not has_auto:
+                                if is_bull and (stf_f_prev <= stf_s_prev and stf_f > stf_s):
+                                    open_trade("LONG", current_price, f"{s1}>{s2} & {l1}>{l2}")
+                                elif is_bear and (stf_f_prev >= stf_s_prev and stf_f < stf_s):
+                                    open_trade("SHORT", current_price, f"{s1}<{s2} & {l1}<{l2}")
+                    except: pass 
+        except Exception as e: print(f"Loop Error: {e}")
         time.sleep(2)
 
 def open_trade(side, price, logic_desc="Manual"):
-    sl = BOT_CONFIG["sl"]
-    tp = BOT_CONFIG["tp"]
-    
     new_trade = {
         "id": str(uuid.uuid4())[:8],
-        "side": side,
-        "size": BOT_CONFIG["qty"],
-        "entryPrice": price,
-        "sl": sl, 
-        "tp": tp, 
-        "fee_rate": BOT_CONFIG["fee"],
-        "pnl": 0.0,
-        "auto": True,
-        "logic": logic_desc,
-        "time": datetime.now().isoformat()
+        "side": side, "size": BOT_CONFIG["qty"], "entryPrice": price,
+        "sl": BOT_CONFIG["sl"], "tp": BOT_CONFIG["tp"], "fee_rate": BOT_CONFIG["fee"],
+        "pnl": 0.0, "auto": True, "logic": logic_desc, "time": datetime.now().isoformat()
     }
-    
     STATE["openTrades"].append(new_trade)
-    
-    if trades_collection:
-        # Use copy() so we don't modify the memory object with _id
-        trades_collection.insert_one(new_trade.copy())
+    if trades_collection: trades_collection.insert_one(new_trade.copy())
 
 def close_trade_internal(trade, current_price, reason="Manual"):
     if trade in STATE["openTrades"]:
         STATE["openTrades"].remove(trade)
-        
         history_item = {
-            "time": datetime.now().isoformat(),
-            "side": trade["side"],
-            "entryPrice": trade["entryPrice"],
-            "exitPrice": current_price,
-            "price": current_price,
-            "qty": trade["size"],
-            "realizedPnl": trade["pnl"],
-            "fee_rate": trade.get("fee_rate", 0.0),
-            "sl": trade.get("sl"),
-            "tp": trade.get("tp"),
-            "logic": trade.get("logic", "Manual"),
-            "reason": reason
+            "time": datetime.now().isoformat(), "side": trade["side"],
+            "entryPrice": trade["entryPrice"], "exitPrice": current_price, "price": current_price,
+            "qty": trade["size"], "realizedPnl": trade["pnl"], "fee_rate": trade.get("fee_rate", 0.0),
+            "sl": trade.get("sl"), "tp": trade.get("tp"), "logic": trade.get("logic", "Manual"), "reason": reason
         }
-        
         STATE["history"].append(history_item)
         STATE["wallet"] += trade["pnl"]
-        
         if trades_collection and history_collection:
             trades_collection.delete_one({"id": trade["id"]})
             history_collection.insert_one(history_item.copy())
@@ -320,56 +235,33 @@ threading.Thread(target=bot_loop, daemon=True).start()
 
 @app.get("/api/market")
 def market():
-    current_time = time.time()
-    s1, s2 = BOT_CONFIG["stf1"], BOT_CONFIG["stf2"]
-    l1, l2 = BOT_CONFIG["ltf1"], BOT_CONFIG["ltf2"]
-    
-    if CACHE["data"] is not None and (current_time - CACHE["last_update"] < 5):
-        return CACHE["data"]
-
-    def pack(df):
-        if df.empty: return []
-        return df[["time","open","high","low","close","rsi"]].to_dict("records")
-        
+    if CACHE["data"] is not None and (time.time() - CACHE["last_update"] < 5): return CACHE["data"]
+    def pack(df): return [] if df.empty else df[["time","open","high","low","close","rsi"]].to_dict("records")
     try:
-        price = last_price()
-        # Build raw data dict first
         raw_data = {
-            "price": price,
-            "stf1": pack(fetch_candles(s1)),
-            "stf2": pack(fetch_candles(s2)),
-            "ltf1": pack(fetch_candles(l1)),
-            "ltf2": pack(fetch_candles(l2)),
+            "price": last_price(),
+            "stf1": pack(fetch_candles(BOT_CONFIG["stf1"])),
+            "stf2": pack(fetch_candles(BOT_CONFIG["stf2"])),
+            "ltf1": pack(fetch_candles(BOT_CONFIG["ltf1"])),
+            "ltf2": pack(fetch_candles(BOT_CONFIG["ltf2"])),
             "config": BOT_CONFIG,
             "state": STATE,
             "openTrades": STATE["openTrades"],
             "history": STATE["history"]
         }
-        
-        # FIX: Clean the ENTIRE object. 
-        # This catches NaNs in 'stf1'/'stf2' (chart data) AND ObjectIds in 'state'
         CACHE["data"] = clean_data(raw_data)
-        CACHE["last_update"] = current_time
+        CACHE["last_update"] = time.time()
         return CACHE["data"]
     except Exception as e:
-        print(f"Market Data Error: {e}")
+        print(f"Market Error: {e}")
         if CACHE["data"]: return CACHE["data"]
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/start")
 def start(req: BotStartReq):
-    BOT_CONFIG["stf1"] = req.stf1
-    BOT_CONFIG["stf2"] = req.stf2
-    BOT_CONFIG["ltf1"] = req.ltf1
-    BOT_CONFIG["ltf2"] = req.ltf2
-    BOT_CONFIG["qty"]  = req.qty
-    BOT_CONFIG["fee"]  = req.fee
-    BOT_CONFIG["sl"]   = req.sl
-    BOT_CONFIG["tp"]   = req.tp
-    
+    BOT_CONFIG.update(req.dict())
     STATE["running"] = True
     update_db_state()
-    # Clean config response just in case
     return {"status": "started", "config": clean_data(BOT_CONFIG)}
 
 @app.post("/api/stop")
@@ -383,29 +275,19 @@ def manual_order(order: ManualOrder):
     price = last_price()
     trade = {
         "id": str(uuid.uuid4())[:8],
-        "side": order.side,
-        "size": order.qty,
-        "entryPrice": price,
-        "sl": order.sl,
-        "tp": order.tp,
-        "fee_rate": 0.1,
-        "pnl": 0.0,
-        "logic": "Manual",
-        "time": datetime.now().isoformat()
+        "side": order.side, "size": order.qty, "entryPrice": price,
+        "sl": order.sl, "tp": order.tp, "fee_rate": 0.1, "pnl": 0.0,
+        "logic": "Manual", "time": datetime.now().isoformat()
     }
-    
     STATE["openTrades"].append(trade)
-    if trades_collection:
-        trades_collection.insert_one(trade.copy())
-        
-    # FIX: Return clean data
+    if trades_collection: trades_collection.insert_one(trade.copy())
     return {"status": "success", "trade": clean_data(trade)}
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
-    trade_to_close = next((t for t in STATE["openTrades"] if t["id"] == req.id), None)
-    if trade_to_close:
-        close_trade_internal(trade_to_close, last_price(), reason="Manual Close")
+    trade = next((t for t in STATE["openTrades"] if t["id"] == req.id), None)
+    if trade:
+        close_trade_internal(trade, last_price(), reason="Manual Close")
         return {"status": "success"}
     raise HTTPException(status_code=404, detail="Trade not found")
 
@@ -413,8 +295,7 @@ def manual_close(req: CloseTradeReq):
 def close_all():
     current_p = last_price()
     count = len(STATE["openTrades"])
-    for t in list(STATE["openTrades"]):
-        close_trade_internal(t, current_p, reason="Close All")
+    for t in list(STATE["openTrades"]): close_trade_internal(t, current_p, reason="Close All")
     return {"status": "success", "closed_count": count}
 
 if __name__ == "__main__":
