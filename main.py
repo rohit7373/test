@@ -1,4 +1,4 @@
-import os, time, threading, uuid
+import os, time, threading, uuid, math
 import pandas as pd
 import pandas_ta as ta
 import ccxt
@@ -9,6 +9,7 @@ from typing import Optional
 from datetime import datetime
 import uvicorn
 from pymongo import MongoClient
+from bson import ObjectId  # <--- CRITICAL IMPORT FOR MONGO ID HANDLING
 
 app = FastAPI()
 
@@ -47,13 +48,24 @@ BOT_CONFIG = {
     "fee": 0.1,   "qty": 0.01
 }
 
-# --- HELPER: CLEAN DATA (Fixes Network Error) ---
+# --- HELPER: ROBUST DATA CLEANER ---
 def clean_data(data):
-    """Removes _id from MongoDB objects so the API doesn't crash"""
+    """
+    Recursively cleans data to ensure it is valid JSON.
+    - Converts ObjectId -> str
+    - Converts NaN/Inf -> None
+    - Handles nested dicts and lists
+    """
     if isinstance(data, list):
         return [clean_data(x) for x in data]
     if isinstance(data, dict):
-        return {k: clean_data(v) for k, v in data.items() if k != "_id"}
+        # Convert _id to str if it exists, otherwise clean value
+        return {k: (str(v) if k == "_id" else clean_data(v)) for k, v in data.items()}
+    if isinstance(data, ObjectId):
+        return str(data)
+    if isinstance(data, float):
+        if math.isnan(data) or math.isinf(data):
+            return None
     return data
 
 # --- DATABASE CONNECTION & LOADING ---
@@ -90,8 +102,8 @@ else:
             })
 
         # 2. LOAD OPEN TRADES
+        # Use clean_data immediately to strip ObjectIds from the start
         db_trades = list(trades_collection.find({}))
-        # Apply clean_data immediately on load
         STATE["openTrades"] = clean_data(db_trades)
 
         # 3. LOAD HISTORY
@@ -267,7 +279,7 @@ def open_trade(side, price, logic_desc="Manual"):
     STATE["openTrades"].append(new_trade)
     
     if trades_collection:
-        # Use copy() to prevent local dict from getting _id, but we also use clean_data in API to be safe
+        # Use copy() so we don't modify the memory object with _id
         trades_collection.insert_one(new_trade.copy())
 
 def close_trade_internal(trade, current_price, reason="Manual"):
@@ -323,7 +335,7 @@ def market():
             "ltf1": pack(fetch_candles(l1)),
             "ltf2": pack(fetch_candles(l2)),
             "config": BOT_CONFIG,
-            # FIX: Clean data before sending to frontend
+            # CRITICAL: Clean STATE data before sending to frontend
             "state": clean_data(STATE),
             "openTrades": clean_data(STATE["openTrades"]),
             "history": clean_data(STATE["history"])
@@ -348,7 +360,8 @@ def start(req: BotStartReq):
     
     STATE["running"] = True
     update_db_state()
-    return {"status": "started", "config": BOT_CONFIG}
+    # Clean config response just in case
+    return {"status": "started", "config": clean_data(BOT_CONFIG)}
 
 @app.post("/api/stop")
 def stop():
@@ -376,7 +389,7 @@ def manual_order(order: ManualOrder):
     if trades_collection:
         trades_collection.insert_one(trade.copy())
         
-    # FIX: Clean data here too
+    # FIX: Return clean data
     return {"status": "success", "trade": clean_data(trade)}
 
 @app.post("/api/manual/close")
