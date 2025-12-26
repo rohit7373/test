@@ -2,8 +2,8 @@ import os, time, threading, uuid, math
 import pandas as pd
 import pandas_ta as ta
 import ccxt
-import numpy as np # <--- Added Numpy to fix type errors
-from fastapi import FastAPI, HTTPException, Request
+import numpy as np
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -64,7 +64,6 @@ def clean_data(data):
     
     # 2. Handle Dictionaries
     if isinstance(data, dict):
-        # Convert _id to string, recursive clean others
         return {k: (str(v) if k == "_id" else clean_data(v)) for k, v in data.items()}
     
     # 3. Handle MongoDB ObjectId
@@ -77,7 +76,7 @@ def clean_data(data):
             return None
         return data
 
-    # 5. Handle Numpy Types (CRITICAL FIX)
+    # 5. Handle Numpy Types
     if isinstance(data, (np.integer, np.int64, np.int32)):
         return int(data)
     if isinstance(data, (np.floating, np.float64, np.float32)):
@@ -124,7 +123,8 @@ TF_MAP = {"1m":"1m", "3m":"3m", "5m":"5m", "15m":"15m", "1h":"1h", "2h":"2h", "4
 CACHE = {"last_update": 0, "data": None}
 
 def update_db():
-    if state_collection:
+    # FIX: Explicit check using 'is not None'
+    if state_collection is not None:
         try:
             state_collection.update_one(
                 {"_id": "global_state"},
@@ -161,7 +161,6 @@ def bot_loop():
                 diff = current_price - t["entryPrice"]
                 if t["side"] == "SHORT": diff = -diff
                 
-                # Numpy Safe Fee Calculation
                 fee = (float(t["size"]) * current_price) * (float(t.get("fee_rate", 0.1))/100)
                 t["pnl"] = (diff * float(t["size"])) - fee
                 total_unrealized += t["pnl"]
@@ -209,7 +208,9 @@ def open_trade(side, price, logic="Manual"):
         "time": datetime.now().isoformat()
     }
     STATE["openTrades"].append(t)
-    if trades_collection: 
+    
+    # FIX: Explicit check
+    if trades_collection is not None: 
         try: trades_collection.insert_one(t.copy())
         except: pass
 
@@ -223,10 +224,12 @@ def close_trade(t, price, reason):
         }
         STATE["history"].append(h)
         STATE["wallet"] += t["pnl"]
-        if trades_collection: 
+        
+        # FIX: Explicit checks
+        if trades_collection is not None: 
             try: trades_collection.delete_one({"id": t["id"]})
             except: pass
-        if history_collection:
+        if history_collection is not None:
             try: history_collection.insert_one(h.copy())
             except: pass
         update_db()
@@ -245,7 +248,7 @@ class ManualOrder(BaseModel):
 class CloseTradeReq(BaseModel):
     id: str
 
-# --- API ENDPOINTS (SAFE WRAPPED) ---
+# --- API ENDPOINTS ---
 
 @app.get("/api/market")
 def market():
@@ -267,7 +270,6 @@ def market():
             "history": STATE["history"]
         }
         
-        # CLEAN EVERYTHING BEFORE RETURN
         CACHE["data"] = clean_data(data)
         CACHE["last_update"] = time.time()
         return CACHE["data"]
@@ -283,7 +285,6 @@ def start(req: BotStartReq):
         update_db()
         return clean_data({"status": "started", "config": BOT_CONFIG})
     except Exception as e:
-        print(f"Start Error: {e}")
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/stop")
@@ -305,13 +306,14 @@ def manual_order(order: ManualOrder):
             "pnl": 0.0, "logic": "Manual", "time": datetime.now().isoformat()
         }
         STATE["openTrades"].append(t)
-        if trades_collection: 
+        
+        # FIX: Explicit check
+        if trades_collection is not None: 
             try: trades_collection.insert_one(t.copy())
             except: pass
             
         return clean_data({"status": "success", "trade": t})
     except Exception as e:
-        print(f"Manual Order Error: {e}")
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/manual/close")
