@@ -53,7 +53,7 @@ def clean_data(data):
     """
     Recursively cleans data to ensure it is valid JSON.
     - Converts ObjectId -> str
-    - Converts NaN/Inf -> None
+    - Converts NaN/Inf -> None (Fixes 'Network Error' caused by RSI NaNs)
     - Handles nested dicts and lists
     """
     if isinstance(data, list):
@@ -168,7 +168,7 @@ def fetch_candles(tf_key, limit=300):
         df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
         df["time"] = (df["time"] / 1000).astype(int)
         df["rsi"] = ta.rsi(df["close"], length=14)
-        df.dropna(inplace=True)
+        # Note: RSI will have NaNs for first 14 rows, clean_data will handle this
         return df
     except Exception as e:
         print(f"Error fetching candles {tf}: {e}")
@@ -228,30 +228,35 @@ def bot_loop():
                 if (len(df_stf_f) >= 2 and len(df_stf_s) >= 2 and 
                     not df_ltf_f.empty and not df_ltf_s.empty):
                     
-                    stf_f_curr = df_stf_f["rsi"].iloc[-1]
-                    stf_s_curr = df_stf_s["rsi"].iloc[-1]
-                    stf_f_prev = df_stf_f["rsi"].iloc[-2]
-                    stf_s_prev = df_stf_s["rsi"].iloc[-2]
-                    
-                    ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
-                    ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
-                    
-                    is_bullish_trend = ltf_f_curr > ltf_s_curr
-                    is_bearish_trend = ltf_f_curr < ltf_s_curr
-                    
-                    has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
+                    try:
+                        stf_f_curr = df_stf_f["rsi"].iloc[-1]
+                        stf_s_curr = df_stf_s["rsi"].iloc[-1]
+                        stf_f_prev = df_stf_f["rsi"].iloc[-2]
+                        stf_s_prev = df_stf_s["rsi"].iloc[-2]
+                        
+                        ltf_f_curr = df_ltf_f["rsi"].iloc[-1]
+                        ltf_s_curr = df_ltf_s["rsi"].iloc[-1]
+                        
+                        # Ensure no NaNs before logic comparison
+                        if not (math.isnan(stf_f_curr) or math.isnan(ltf_f_curr)):
+                            is_bullish_trend = ltf_f_curr > ltf_s_curr
+                            is_bearish_trend = ltf_f_curr < ltf_s_curr
+                            
+                            has_auto_trade = any(t.get('auto', False) for t in STATE["openTrades"])
 
-                    if not has_auto_trade:
-                        logic_str = ""
-                        # LONG
-                        if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
-                            logic_str = f"{s1_key}>{s2_key} & {l1_key}>{l2_key}"
-                            open_trade("LONG", current_price, logic_str)
+                            if not has_auto_trade:
+                                logic_str = ""
+                                # LONG
+                                if is_bullish_trend and (stf_f_prev <= stf_s_prev and stf_f_curr > stf_s_curr):
+                                    logic_str = f"{s1_key}>{s2_key} & {l1_key}>{l2_key}"
+                                    open_trade("LONG", current_price, logic_str)
 
-                        # SHORT
-                        elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
-                            logic_str = f"{s1_key}<{s2_key} & {l1_key}<{l2_key}"
-                            open_trade("SHORT", current_price, logic_str)
+                                # SHORT
+                                elif is_bearish_trend and (stf_f_prev >= stf_s_prev and stf_f_curr < stf_s_curr):
+                                    logic_str = f"{s1_key}<{s2_key} & {l1_key}<{l2_key}"
+                                    open_trade("SHORT", current_price, logic_str)
+                    except Exception:
+                        pass # Ignore calculation errors in loop
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
@@ -328,18 +333,22 @@ def market():
         
     try:
         price = last_price()
-        CACHE["data"] = {
+        # Build raw data dict first
+        raw_data = {
             "price": price,
             "stf1": pack(fetch_candles(s1)),
             "stf2": pack(fetch_candles(s2)),
             "ltf1": pack(fetch_candles(l1)),
             "ltf2": pack(fetch_candles(l2)),
             "config": BOT_CONFIG,
-            # CRITICAL: Clean STATE data before sending to frontend
-            "state": clean_data(STATE),
-            "openTrades": clean_data(STATE["openTrades"]),
-            "history": clean_data(STATE["history"])
+            "state": STATE,
+            "openTrades": STATE["openTrades"],
+            "history": STATE["history"]
         }
+        
+        # FIX: Clean the ENTIRE object. 
+        # This catches NaNs in 'stf1'/'stf2' (chart data) AND ObjectIds in 'state'
+        CACHE["data"] = clean_data(raw_data)
         CACHE["last_update"] = current_time
         return CACHE["data"]
     except Exception as e:
