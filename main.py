@@ -17,6 +17,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# --- CONFIGURATION & DB SETUP ---
+MONGO_URL = os.environ.get("MONGO_URL")
+
+if not MONGO_URL:
+    # Use a default URL only if running locally and MONGO_URL is not set
+    print("❌ WARNING: MONGO_URL environment variable not found. Check Railway configuration.")
+    # For local testing, ensure MongoDB is running on default port:
+    # MONGO_URL = "mongodb://localhost:27017/" 
+    # raise Exception("MONGO_URL is not set. Cannot connect to MongoDB.")
+
+try:
+    client = MongoClient(MONGO_URL)
+    db = client.trading_bot # Database name
+    
+    # Collections for persistence
+    state_collection = db.state_collection
+    trades_collection = db.open_trades
+    history_collection = db.history
+    
+    print("✅ MongoDB Client Initialized and Connected")
+
+except Exception as e:
+    print(f"❌ FATAL: Could not connect to MongoDB. Trades will NOT be persistent: {e}")
+    # In a production environment, you might want to raise an exception here
+    # For now, we continue but persistence will fail.
 
 # --- CONFIGURATION ---
 exchange = ccxt.binance({"enableRateLimit": True})
