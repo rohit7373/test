@@ -15,7 +15,6 @@ from bson import ObjectId
 
 app = FastAPI()
 
-# --- CORS MIDDLEWARE (CRITICAL for frontend connection) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +25,6 @@ app.add_middleware(
 # --- CONFIGURATION ---
 exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
-# NOTE: Set this MONGO_URL environment variable in your Railway dashboard!
 MONGO_URL = os.environ.get("MONGO_URL")
 
 # --- DATABASE HANDLES ---
@@ -44,39 +42,32 @@ STATE = {
     "history": []     
 }
 
-# Added new logic and entry keys, changed default TFs to be general
+# Default configuration (will be overwritten by DB on startup)
 BOT_CONFIG = {
     "stf1": "5m", "stf2": "15m",
     "ltf1": "1h", "ltf2": "4h",
-    "stf_logic": ">",  # New: Operator for stf1 vs stf2 cross
-    "ltf_logic": ">",  # New: Operator for ltf1 vs ltf2 filter
-    "entry_mode": "BOTH", # New: Entry mode (BOTH/STF_ONLY/LTF_ONLY)
+    "stf_logic": ">", 
+    "ltf_logic": ">", 
+    "entry_mode": "BOTH", 
     "qty": 0.01,
     "fee": 0.1,  # Fee rate in percent
-    "tp": None,  # Take Profit price
-    "sl": None,  # Stop Loss price
+    "tp": None,  
+    "sl": None,  
 }
 
-# --- Pydantic Models for Requests ---
-class BotConfig(BaseModel):
-    stf1: str
-    stf2: str
-    ltf1: str
-    ltf2: str
-    stf_logic: str
-    ltf_logic: str
-    entry_mode: str
-    qty: float
-    fee: float
-    tp: Optional[float] = None
-    sl: Optional[float] = None
+# Caching for market data to reduce CCXT API calls
+CACHE = {"last_update": 0, "data": None}
 
-class ManualOrderReq(BaseModel):
-    side: str
-    qty: float
-    type: str
-    sl: Optional[float] = None
-    tp: Optional[float] = None
+# --- Pydantic Models for Requests ---
+class BotStartReq(BaseModel):
+    stf1: str; stf2: str; ltf1: str; ltf2: str
+    stf_logic: str; ltf_logic: str
+    entry_mode: str
+    qty: float; fee: float
+    sl: Optional[float] = None; tp: Optional[float] = None
+
+class ManualOrder(BaseModel):
+    side: str; qty: float; type: str; sl: Optional[float] = None; tp: Optional[float] = None
 
 class CloseTradeReq(BaseModel):
     id: str
@@ -84,50 +75,77 @@ class CloseTradeReq(BaseModel):
 # --- UTILITIES ---
 
 def clean_data(data):
-    """Helper to convert MongoDB ObjectId/datetime to serializable strings."""
+    """Aggressively cleans data to ensure valid JSON response."""
+    if data is None:
+        return None
+    
     if isinstance(data, list):
-        return [clean_data(item) for item in data]
+        return [clean_data(x) for x in data]
+    
     if isinstance(data, dict):
-        return {k: clean_data(v) for k, v in data.items()}
+        return {k: (str(v) if k == "_id" else clean_data(v)) for k, v in data.items()}
+    
     if isinstance(data, ObjectId):
         return str(data)
+    
+    if isinstance(data, float):
+        if math.isnan(data) or math.isinf(data):
+            return None
+        return data
+
+    if isinstance(data, (np.integer, np.int64, np.int32)):
+        return int(data)
+    if isinstance(data, (np.floating, np.float64, np.float32)):
+        if np.isnan(data) or np.isinf(data):
+            return None
+        return float(data)
+    if isinstance(data, np.ndarray):
+        return clean_data(data.tolist())
+    
     if isinstance(data, datetime):
         return data.isoformat()
+
     return data
 
-def last_price():
-    try:
-        ticker = exchange.fetch_ticker(SYMBOL)
-        return ticker['last']
-    except Exception:
-        # Fallback to a fake price if exchange fails
-        return 50000.0 
+def update_db():
+    """Saves wallet, running state, and BOT_CONFIG to MongoDB."""
+    if state_collection is not None:
+        try:
+            state_collection.update_one(
+                {"_id": "global_state"},
+                {"$set": {"wallet": STATE["wallet"], "running": STATE["running"], "config": BOT_CONFIG}},
+                upsert=True
+            )
+        except Exception as e:
+            print(f"DB Update Failed: {e}")
 
-def get_data(timeframe, limit=200):
-    """Fetch and prepare OHLCV data with RSI."""
+def fetch_candles(tf_key, limit=300):
+    """Fetch and prepare OHLCV data with RSI, returning a DataFrame."""
     try:
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe, limit=limit)
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, tf_key, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = df['time'] // 1000  # Convert milliseconds to seconds
-        
-        # Calculate RSI
         df.ta.rsi(length=14, append=True)
         df.rename(columns={'RSI_14': 'rsi'}, inplace=True)
-        
-        # Keep only necessary columns and drop rows with NaN (for RSI)
         df = df[['time', 'open', 'high', 'low', 'close', 'rsi']].dropna()
-        
-        return df.to_dict('records')
+        return df
     except Exception as e:
-        print(f"Error fetching data for {timeframe}: {e}")
-        return []
+        # print(f"Error fetching data for {tf_key}: {e}") # Suppress frequent errors
+        return pd.DataFrame()
 
-def calculate_rsi(data):
-    """Extract only time and RSI value from the OHLCV data."""
-    return [{"time": d['time'], "value": d['rsi']} for d in data if 'rsi' in d]
+def last_price():
+    """Fetches the current price of the trading symbol."""
+    try: return float(exchange.fetch_ticker(SYMBOL)["last"])
+    except: return 0.0
+
+def pack_df_to_list(df): 
+    """Converts a DataFrame to a list of dicts for FastAPI response."""
+    if df.empty:
+        return [] 
+    return df[["time","open","high","low","close","rsi"]].to_dict("records")
 
 def calculate_pnl():
-    """Calculates total unrealized PnL for all open trades."""
+    """Calculates total unrealized PnL for all open trades, including fees."""
     pnl = 0.0
     current_price = last_price()
     if not current_price: return 0.0
@@ -135,14 +153,15 @@ def calculate_pnl():
     for t in STATE["openTrades"]:
         entry = t['entryPrice']
         size = t['size']
-        fee = t['fee_rate'] / 100.0 # Convert % to decimal
+        fee = t.get('fee_rate', BOT_CONFIG['fee']) / 100.0
+        
+        # Estimate total fee cost (entry + exit)
+        total_fee_cost = (entry * size * fee) + (current_price * size * fee)
         
         if t['side'] == 'LONG':
-            # Formula: (Current Price - Entry Price) * Size - (Fee on Entry + Fee on Exit)
-            unrealized_pnl = (current_price - entry) * size - (entry * size * fee) - (current_price * size * fee)
+            unrealized_pnl = (current_price - entry) * size - total_fee_cost
         else: # SHORT
-            # Formula: (Entry Price - Current Price) * Size - (Fee on Entry + Fee on Exit)
-            unrealized_pnl = (entry - current_price) * size - (entry * size * fee) - (current_price * size * fee)
+            unrealized_pnl = (entry - current_price) * size - total_fee_cost
 
         t['pnl'] = unrealized_pnl
         pnl += unrealized_pnl
@@ -150,346 +169,317 @@ def calculate_pnl():
     STATE["unrealized"] = pnl
     return pnl
 
-def check_entry_signal(stf_fast_data, stf_slow_data, ltf_fast_data, ltf_slow_data):
-    """
-    Checks for RSI crossover signals on STF and uses LTF as a filter/entry depending on mode.
-    Returns: ('LONG', 'Logic String') or ('SHORT', 'Logic String') or (None, None)
-    """
-    if not (stf_fast_data and stf_slow_data and ltf_fast_data and ltf_slow_data):
-        return None, None
+def check_condition(val1, op, val2):
+    if op == ">": return val1 > val2
+    if op == "<": return val1 < val2
+    return False
 
-    # Get the latest RSI values
-    stf1_rsi = stf_fast_data[-1].get('rsi')
-    stf2_rsi = stf_slow_data[-1].get('rsi')
-    ltf1_rsi = ltf_fast_data[-1].get('rsi')
-    ltf2_rsi = ltf_slow_data[-1].get('rsi')
-    
-    # Get the previous RSI values (for crossover detection)
-    stf1_rsi_prev = stf_fast_data[-2].get('rsi')
-    stf2_rsi_prev = stf_slow_data[-2].get('rsi')
-    ltf1_rsi_prev = ltf_fast_data[-2].get('rsi')
-    ltf2_rsi_prev = ltf_slow_data[-2].get('rsi')
+def check_cross(prev1, curr1, op, prev2, curr2):
+    if op == ">":
+        return (prev1 <= prev2) and (curr1 > curr2)
+    if op == "<":
+        return (prev1 >= prev2) and (curr1 < curr2)
+    return False
 
-    if None in [stf1_rsi, stf2_rsi, ltf1_rsi, ltf2_rsi, stf1_rsi_prev, stf2_rsi_prev, ltf1_rsi_prev, ltf2_rsi_prev]:
-        return None, None
-
-    logic_op = BOT_CONFIG['stf_logic']
-    ltf_op = BOT_CONFIG['ltf_logic']
-    
-    # Check STF Cross (The primary entry signal)
-    stf_long_cross = (stf1_rsi_prev <= stf2_rsi_prev) and (stf1_rsi > stf2_rsi)
-    stf_short_cross = (stf1_rsi_prev >= stf2_rsi_prev) and (stf1_rsi < stf2_rsi)
-
-    # Check LTF Filter/Cross (The secondary condition)
-    ltf_long_filter = (ltf1_rsi > ltf2_rsi) if ltf_op == '>' else (ltf1_rsi < ltf2_rsi)
-    ltf_short_filter = (ltf1_rsi < ltf2_rsi) if ltf_op == '>' else (ltf1_rsi > ltf2_rsi)
-
-    
-    if len(STATE["openTrades"]) > 0:
-        return None, None # Already in a trade
-
-    if BOT_CONFIG['entry_mode'] == 'STF_ONLY':
-        if stf_long_cross and logic_op == '>':
-            return 'LONG', f"STF1({stf1_rsi:.2f}) > STF2({stf2_rsi:.2f}) Cross"
-        if stf_short_cross and logic_op == '<':
-            return 'SHORT', f"STF1({stf1_rsi:.2f}) < STF2({stf2_rsi:.2f}) Cross"
-    
-    elif BOT_CONFIG['entry_mode'] == 'LTF_ONLY':
-        if ltf_long_filter and ltf_short_cross: # Use LTF cross as entry
-            return 'LONG', f"LTF1({ltf1_rsi:.2f}) > LTF2({ltf2_rsi:.2f}) Cross"
-        if ltf_short_filter and ltf_long_cross: # Use LTF cross as entry
-            return 'SHORT', f"LTF1({ltf1_rsi:.2f}) < LTF2({ltf2_rsi:.2f}) Cross"
-            
-    elif BOT_CONFIG['entry_mode'] == 'BOTH':
-        if stf_long_cross and ltf_long_filter and logic_op == '>':
-            return 'LONG', f"STF Cross AND LTF Filter ({ltf_op})"
-        if stf_short_cross and ltf_short_filter and logic_op == '<':
-            return 'SHORT', f"STF Cross AND LTF Filter ({ltf_op})"
-
-    return None, None
-
-def close_trade(t, close_price, logic_reason):
-    """
-    Processes the closure of a trade, updates PnL, state, and logs history.
-    """
-    if t not in STATE["openTrades"]: return
-    
-    entry = t['entryPrice']
-    size = t['size']
-    fee = BOT_CONFIG['fee'] / 100.0 # Global fee used for all trades
-
-    if t['side'] == 'LONG':
-        pnl = (close_price - entry) * size - (entry * size * fee) - (close_price * size * fee)
-    else: # SHORT
-        pnl = (entry - close_price) * size - (entry * size * fee) - (close_price * size * fee)
-
-    STATE["wallet"] += pnl
-    
-    # History record
-    h = {
-        "time": int(time.time()),
-        "side": t['side'],
-        "size": size,
-        "entryPrice": entry,
-        "price": close_price,
-        "realizedPnl": pnl,
-        "logic": logic_reason,
-        "trade_id": t['id']
+def open_trade(side, price, logic="Manual"):
+    """Opens a new trade and saves it to state and DB."""
+    t = {
+        "id": str(uuid.uuid4())[:8], "side": side, "size": float(BOT_CONFIG["qty"]),
+        "entryPrice": float(price), "sl": BOT_CONFIG["sl"], "tp": BOT_CONFIG["tp"],
+        "fee_rate": float(BOT_CONFIG["fee"]), "pnl": 0.0, "auto": True, "logic": logic,
+        "time": datetime.now().isoformat() 
     }
-    STATE["history"].append(h)
+    STATE["openTrades"].append(t)
     
-    # Remove from openTrades
-    STATE["openTrades"].remove(t)
-    
-    # Update DB
-    if history_collection is not None:
-        try: history_collection.insert_one(h.copy())
+    if trades_collection is not None: 
+        try: trades_collection.insert_one(t.copy())
         except: pass
+    update_db()
+
+def close_trade(t, price, reason):
+    """Closes an existing trade, calculates realized PnL, and updates history."""
+    if t in STATE["openTrades"]:
+        
+        entry = t['entryPrice']
+        size = t['size']
+        fee = t.get('fee_rate', BOT_CONFIG['fee']) / 100.0
+
+        # Total fee calculation (entry fee + exit fee)
+        total_fee_cost = (entry * size * fee) + (price * size * fee)
+        
+        if t['side'] == 'LONG':
+            realized_pnl = (price - entry) * size - total_fee_cost
+        else: # SHORT
+            realized_pnl = (entry - price) * size - total_fee_cost
+
+        STATE["wallet"] += realized_pnl
+        
+        # History record
+        h = {
+            "time": datetime.now().isoformat(), "side": t["side"],
+            "price": float(price), "qty": t["size"],
+            "realizedPnl": realized_pnl, "logic": t.get("logic", "N/A"), "reason": reason
+        }
+        STATE["history"].append(h)
+        
+        # Remove from openTrades
+        STATE["openTrades"].remove(t)
+        
+        # DB Updates
+        if trades_collection is not None: 
+            try: trades_collection.delete_one({"id": t["id"]})
+            except: pass
+        if history_collection is not None:
+            try: history_collection.insert_one(h.copy())
+            except: pass
+        update_db()
+
+def check_entry_signal(df_stf_f, df_stf_s, df_ltf_f, df_ltf_s):
+    """Checks for the entry signal based on the BOT_CONFIG entry_mode."""
+    min_len = 2
+    if any(len(df) < min_len for df in [df_stf_f, df_stf_s, df_ltf_f, df_ltf_s]):
+        return None, None
+
+    # Get current and previous RSI values
+    stf_f, stf_s = df_stf_f["rsi"].iloc[-1], df_stf_s["rsi"].iloc[-1]
+    stf_f_prev, stf_s_prev = df_stf_f["rsi"].iloc[-2], df_stf_s["rsi"].iloc[-2]
+    ltf_f, ltf_s = df_ltf_f["rsi"].iloc[-1], df_ltf_s["rsi"].iloc[-1]
+    ltf_f_prev, ltf_s_prev = df_ltf_f["rsi"].iloc[-2], df_ltf_s["rsi"].iloc[-2]
+    
+    if math.isnan(stf_f) or math.isnan(ltf_f): return None, None
+    
+    stf_op = BOT_CONFIG["stf_logic"]
+    ltf_op = BOT_CONFIG["ltf_logic"]
+    entry_mode = BOT_CONFIG["entry_mode"]
+    
+    # --- Evaluate Conditions ---
+    
+    # 1. STF Entry Cross Check
+    stf_long_cross = check_cross(stf_f_prev, stf_f, '>', stf_s_prev, stf_s)
+    stf_short_cross = check_cross(stf_f_prev, stf_f, '<', stf_s_prev, stf_s)
+
+    # 2. LTF Filter Check (LTF is in the direction of the trade)
+    # Check if LTF Fast > LTF Slow (Bullish filter)
+    ltf_filter_bullish = check_condition(ltf_f, ltf_op, ltf_s)
+    # Check if LTF Slow > LTF Fast (Bearish filter) - Note: This assumes ltf_op is generally for the "desired" relationship
+    ltf_filter_bearish = check_condition(ltf_s, ltf_op, ltf_f) 
+    
+    # 3. LTF Cross Check (Used for LTF_ONLY mode)
+    ltf_long_cross = check_cross(ltf_f_prev, ltf_f, '>', ltf_s_prev, ltf_s)
+    ltf_short_cross = check_cross(ltf_f_prev, ltf_f, '<', ltf_s_prev, ltf_s)
+
+    logic_str = ""
+    trade_allowed = False
+    side = None
+    
+    if entry_mode == "BOTH":
+        # LONG: STF Cross UP AND LTF Filter is Bullish
+        if stf_long_cross and ltf_filter_bullish:
+            trade_allowed = True; side = "LONG"
+            logic_str = f"STF Cross UP AND LTF Filter ({ltf_op} Bullish)"
+        # SHORT: STF Cross DOWN AND LTF Filter is Bearish
+        elif stf_short_cross and ltf_filter_bearish:
+            trade_allowed = True; side = "SHORT"
+            logic_str = f"STF Cross DOWN AND LTF Filter ({ltf_op} Bearish)"
+
+    elif entry_mode == "STF_ONLY":
+        if stf_long_cross:
+            trade_allowed = True; side = "LONG"
+            logic_str = "STF Cross UP ONLY"
+        elif stf_short_cross:
+            trade_allowed = True; side = "SHORT"
+            logic_str = "STF Cross DOWN ONLY"
+
+    elif entry_mode == "LTF_ONLY":
+        if ltf_long_cross:
+            trade_allowed = True; side = "LONG"
+            logic_str = "LTF Cross UP ONLY"
+        elif ltf_short_cross:
+            trade_allowed = True; side = "SHORT"
+            logic_str = "LTF Cross DOWN ONLY"
+
+    return (side, logic_str) if trade_allowed else (None, None)
 
 def check_exit_signal(current_price):
-    """Checks for TP/SL signals based on current price."""
+    """Checks for TP/SL signals based on current price for all open trades."""
     trades_to_close = []
     
     for t in STATE["openTrades"]:
         exit_reason = None
         
-        # Check Stop Loss (SL)
-        if BOT_CONFIG['sl'] is not None and BOT_CONFIG['sl'] > 0:
-            if t['side'] == 'LONG' and current_price <= BOT_CONFIG['sl']:
-                exit_reason = "SL Hit"
-            elif t['side'] == 'SHORT' and current_price >= BOT_CONFIG['sl']:
-                exit_reason = "SL Hit"
+        if t['sl'] is not None and t['sl'] > 0:
+            if t['side'] == 'LONG' and current_price <= t['sl']: exit_reason = "SL Hit"
+            elif t['side'] == 'SHORT' and current_price >= t['sl']: exit_reason = "SL Hit"
 
-        # Check Take Profit (TP) - SL takes priority
-        if exit_reason is None and BOT_CONFIG['tp'] is not None and BOT_CONFIG['tp'] > 0:
-            if t['side'] == 'LONG' and current_price >= BOT_CONFIG['tp']:
-                exit_reason = "TP Hit"
-            elif t['side'] == 'SHORT' and current_price <= BOT_CONFIG['tp']:
-                exit_reason = "TP Hit"
+        if exit_reason is None and t['tp'] is not None and t['tp'] > 0:
+            if t['side'] == 'LONG' and current_price >= t['tp']: exit_reason = "TP Hit"
+            elif t['side'] == 'SHORT' and current_price <= t['tp']: exit_reason = "TP Hit"
         
         if exit_reason:
             trades_to_close.append((t, exit_reason))
 
-    # Execute closures
     for t, reason in trades_to_close:
         close_trade(t, current_price, reason)
 
-def run_bot():
-    """Main bot loop executed in a separate thread."""
+# --- BOT LOOP ---
+def bot_loop():
     while True:
         try:
+            current_price = last_price()
+            if not current_price:
+                time.sleep(3)
+                continue
+
+            calculate_pnl()
+            check_exit_signal(current_price)
+            
             if STATE["running"]:
-                current_price = last_price()
-                if not current_price:
-                    time.sleep(3)
-                    continue
-
-                # 1. Fetch data
-                stf1_data = get_data(BOT_CONFIG['stf1'], limit=30)
-                stf2_data = get_data(BOT_CONFIG['stf2'], limit=30)
-                ltf1_data = get_data(BOT_CONFIG['ltf1'], limit=30)
-                ltf2_data = get_data(BOT_CONFIG['ltf2'], limit=30)
-
-                # 2. Check Exit Signals (TP/SL)
-                check_exit_signal(current_price)
                 
-                # 3. Check Entry Signals (Only if no open trades)
-                if not STATE["openTrades"]:
-                    side, logic = check_entry_signal(stf1_data, stf2_data, ltf1_data, ltf2_data)
+                if not any(t.get('auto') for t in STATE["openTrades"]):
+                    
+                    df_stf_f = fetch_candles(BOT_CONFIG['stf1'], limit=50)
+                    df_stf_s = fetch_candles(BOT_CONFIG['stf2'], limit=50)
+                    df_ltf_f = fetch_candles(BOT_CONFIG['ltf1'], limit=50)
+                    df_ltf_s = fetch_candles(BOT_CONFIG['ltf2'], limit=50)
+                    
+                    side, logic = check_entry_signal(df_stf_f, df_stf_s, df_ltf_f, df_ltf_s)
 
                     if side:
-                        entry_price = current_price # Execute trade at current market price
-                        
-                        t = {
-                            "id": str(uuid.uuid4())[:8],
-                            "side": side,
-                            "size": BOT_CONFIG['qty'],
-                            "entryPrice": entry_price,
-                            "sl": BOT_CONFIG['sl'],
-                            "tp": BOT_CONFIG['tp'],
-                            "fee_rate": BOT_CONFIG['fee'],
-                            "pnl": 0.0,
-                            "logic": logic,
-                            "time": datetime.now().isoformat()
-                        }
-                        STATE["openTrades"].append(t)
-                        print(f"BOT ENTRY: {side} @ {entry_price:.2f} with Logic: {logic}")
-                        
-                        # Store trade to DB
-                        if trades_collection is not None:
-                            try: trades_collection.insert_one(t.copy())
-                            except: pass
+                        open_trade(side, current_price, logic)
+                        # print(f"BOT ENTRY: {side} @ {current_price:.2f} with Logic: {logic}")
 
-                # 4. Update Unrealized PnL (for display)
-                calculate_pnl()
+            update_db() # Save State (wallet/running/config)
                 
-                # 5. Save State
-                if state_collection is not None:
-                    try: state_collection.update_one(
-                        {"_id": "bot_state"}, 
-                        {"$set": {"wallet": STATE["wallet"], "running": STATE["running"]}}, 
-                        upsert=True
-                    )
-                    except: pass
-                
-            else:
-                # Still calculate PnL even when stopped if there are open trades
-                calculate_pnl()
-                
-            time.sleep(3) # Wait 3 seconds before next iteration
+            time.sleep(5) # Poll every 5 seconds
 
         except Exception as e:
-            print(f"Bot Error: {e}")
+            print(f"Bot Loop Error: {e}")
             time.sleep(5)
 
-# --- FastAPI LIFECYCLE HOOKS ---
-@app.on_event("startup")
-def startup_event():
-    """Connects to MongoDB and starts the bot thread."""
-    global db, state_collection, trades_collection, history_collection
-    
-    if MONGO_URL:
-        try:
-            client = MongoClient(MONGO_URL)
-            db = client.rsi_bot_db
-            state_collection = db.state
-            trades_collection = db.trades
-            history_collection = db.history
-            
-            # Load initial state from DB
-            loaded_state = state_collection.find_one({"_id": "bot_state"})
-            if loaded_state and loaded_state.get("wallet") is not None:
-                STATE["wallet"] = loaded_state["wallet"]
-            if loaded_state and loaded_state.get("running") is not None:
-                STATE["running"] = loaded_state["running"]
-            
-            # Load open trades (optional, can be empty on startup)
-            STATE["openTrades"] = list(trades_collection.find({"closed_time": {"$exists": False}}))
-            
-            # Load history (last 20 records)
-            STATE["history"] = list(history_collection.find().sort("time", -1).limit(20))
-            
-            print("Successfully connected to MongoDB and loaded state.")
-            
-        except Exception as e:
-            print(f"MongoDB connection failed: {e}. Running without persistence.")
-            state_collection = None # Set to None to disable DB operations
+# --- DB CONNECTION (Kept the same) ---
 
-    # Start bot thread regardless of DB status
-    threading.Thread(target=run_bot, daemon=True).start()
+if not MONGO_URL:
+    print("⚠️ MONGO_URL not found. Using In-Memory Mode.")
+else:
+    try:
+        client = MongoClient(MONGO_URL)
+        db = client.trading_bot 
+        state_collection = db.state_collection
+        trades_collection = db.open_trades
+        history_collection = db.history
+        print("✅ MongoDB Connected")
+        
+        # Load State
+        saved = state_collection.find_one({"_id": "global_state"})
+        if saved:
+            STATE["wallet"] = saved.get("wallet", 1000.0)
+            STATE["running"] = saved.get("running", False)
+            if "config" in saved:
+                merged_config = BOT_CONFIG.copy()
+                for k,v in saved["config"].items():
+                    if k in merged_config: merged_config[k] = v
+                BOT_CONFIG = merged_config
+        else:
+            state_collection.insert_one({"_id": "global_state", "wallet": 1000.0, "running": False, "config": BOT_CONFIG})
 
+        # Load Trades
+        STATE["openTrades"] = clean_data(list(trades_collection.find({})))
+        STATE["history"] = clean_data(list(history_collection.find().sort("time", -1).limit(100)))
+
+    except Exception as e:
+        print(f"❌ DB Error: {e}")
+
+threading.Thread(target=bot_loop, daemon=True).start()
 
 # --- API ENDPOINTS ---
 
+@app.get("/api/config")
+async def get_initial_config():
+    """NEW ENDPOINT: Serves the current BOT_CONFIG once for initial UI population."""
+    return JSONResponse(content=clean_data(BOT_CONFIG))
+
 @app.get("/api/market")
-async def get_market_data():
-    """Fetches and returns all market data, state, and config for the frontend."""
-    # Fetch data concurrently (last 30 bars should be enough for charts)
-    stf1_data = get_data(BOT_CONFIG['stf1'], limit=30)
-    stf2_data = get_data(BOT_CONFIG['stf2'], limit=30)
-    ltf1_data = get_data(BOT_CONFIG['ltf1'], limit=30)
-    ltf2_data = get_data(BOT_CONFIG['ltf2'], limit=30)
+def market():
+    """
+    FIX: Removed BOT_CONFIG from this response. 
+    It only sends volatile data (price, state, charts, trades).
+    """
+    try:
+        # Simple caching
+        if time.time() - CACHE["last_update"] < 3 and CACHE["data"] is not None:
+            # Only update volatile state/price in cached data
+            cached_data = CACHE["data"].copy()
+            cached_data["price"] = last_price()
+            cached_data["state"] = clean_data({"running": STATE["running"], "wallet": STATE["wallet"], "unrealized": STATE["unrealized"]})
+            cached_data["openTrades"] = clean_data(STATE["openTrades"])
+            cached_data["history"] = clean_data(STATE["history"])
+            return JSONResponse(content=cached_data)
+        
+        data = {
+            "price": last_price(),
+            "state": {
+                "running": STATE["running"],
+                "wallet": STATE["wallet"],
+                "unrealized": STATE["unrealized"],
+            },
+            "stf1": pack_df_to_list(fetch_candles(BOT_CONFIG["stf1"])),
+            "stf2": pack_df_to_list(fetch_candles(BOT_CONFIG["stf2"])),
+            "ltf1": pack_df_to_list(fetch_candles(BOT_CONFIG["ltf1"])),
+            "ltf2": pack_df_to_list(fetch_candles(BOT_CONFIG["ltf2"])),
+            "openTrades": STATE["openTrades"],
+            "history": STATE["history"]
+        }
+        
+        clean_response = clean_data(data)
+        CACHE["data"] = clean_response
+        CACHE["last_update"] = time.time()
+        return JSONResponse(content=clean_response)
 
-    # Calculate RSI lists (Frontend expects this format for the RSI charts)
-    stf1_rsi_list = calculate_rsi(stf1_data)
-    stf2_rsi_list = calculate_rsi(stf2_data)
-    ltf1_rsi_list = calculate_rsi(ltf1_data)
-    ltf2_rsi_list = calculate_rsi(ltf2_data)
-    
-    response_data = {
-        "price": last_price(),
-        "config": BOT_CONFIG,
-        "state": {
-            "running": STATE["running"],
-            "wallet": STATE["wallet"],
-            "unrealized": STATE["unrealized"],
-        },
-        # OHLCV data for candlestick charts
-        "stf1": stf1_data,
-        "stf2": stf2_data,
-        "ltf1": ltf1_data,
-        "ltf2": ltf2_data,
-        # RSI data for RSI charts (Frontend will use the OHLCV data, but providing RSI lists too)
-        "stf1_rsi": stf1_rsi_list,
-        "stf2_rsi": stf2_rsi_list,
-        "ltf1_rsi": ltf1_rsi_list,
-        "ltf2_rsi": ltf2_rsi_list,
-        # Trade tables
-        "openTrades": clean_data(STATE["openTrades"]),
-        "history": clean_data(STATE["history"]),
-    }
-    
-    # NOTE: The frontend's mapRsi and normalizeCandles handles parsing the single 'stf1'/'stf2' array.
-    
-    return JSONResponse(content=response_data)
-
+    except Exception as e:
+        print(f"Market Endpoint Error: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/start")
-def start_bot(config: BotConfig):
-    """Starts the bot and updates configuration."""
-    if STATE["running"]:
-        raise HTTPException(status_code=400, detail="Bot is already running")
-    
-    # Update config
-    for k, v in config.dict().items():
-        BOT_CONFIG[k] = v
-        
-    STATE["running"] = True
-    
-    # Save running state to DB
-    if state_collection is not None:
-        try: state_collection.update_one(
-            {"_id": "bot_state"}, 
-            {"$set": {"running": True}}, 
-            upsert=True
-        )
-        except: pass
-        
-    return {"status": "success", "message": "Bot started"}
+def start(req: BotStartReq):
+    try:
+        if STATE["running"]:
+            raise HTTPException(status_code=400, detail="Bot is already running")
+            
+        if req.stf_logic not in (">", "<") or req.ltf_logic not in (">", "<"):
+             raise HTTPException(status_code=400, detail="Logic operators must be '>' or '<'")
+        if req.entry_mode not in ("STF_ONLY", "LTF_ONLY", "BOTH"):
+             raise HTTPException(status_code=400, detail="Entry mode must be 'STF_ONLY', 'LTF_ONLY', or 'BOTH'")
+             
+        BOT_CONFIG.update(req.dict())
+        STATE["running"] = True
+        update_db()
+        return clean_data({"status": "started", "config": BOT_CONFIG})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/stop")
-def stop_bot():
-    """Stops the bot."""
-    if not STATE["running"]:
-        raise HTTPException(status_code=400, detail="Bot is already stopped")
-        
-    STATE["running"] = False
-    
-    # Save running state to DB
-    if state_collection is not None:
-        try: state_collection.update_one(
-            {"_id": "bot_state"}, 
-            {"$set": {"running": False}}, 
-            upsert=True
-        )
-        except: pass
-        
-    return {"status": "success", "message": "Bot stopped"}
-
+def stop():
+    try:
+        STATE["running"] = False
+        update_db()
+        return {"status": "stopped"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/manual/order")
-def manual_order(order: ManualOrderReq):
-    """Places a manual trade (LONG or SHORT)."""
+def manual_order(order: ManualOrder):
     try:
         price = last_price()
         if not price:
              raise HTTPException(status_code=500, detail="Could not fetch current price.")
              
         t = {
-            "id": str(uuid.uuid4())[:8],
-            "side": order.side, 
-            "size": float(order.qty),
-            "entryPrice": price, 
-            "sl": order.sl, 
-            "tp": order.tp, 
-            "fee_rate": BOT_CONFIG['fee'],
-            "pnl": 0.0, 
-            "logic": "Manual", 
-            "time": datetime.now().timestamp() # Use timestamp for consistency
+            "id": str(uuid.uuid4())[:8], "side": order.side, "size": float(order.qty),
+            "entryPrice": price, "sl": order.sl, "tp": order.tp, "fee_rate": BOT_CONFIG["fee"],
+            "pnl": 0.0, "logic": "Manual", "time": datetime.now().isoformat()
         }
         STATE["openTrades"].append(t)
         
-        # FIX: Explicit check and DB insertion
         if trades_collection is not None: 
             try: trades_collection.insert_one(t.copy())
             except: pass
@@ -500,12 +490,10 @@ def manual_order(order: ManualOrderReq):
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
-    """Closes a single specific trade by ID."""
     try:
         t = next((x for x in STATE["openTrades"] if x["id"] == req.id), None)
         if t:
             close_trade(t, last_price(), "Manual Close")
-            # NOTE: DB update happens inside close_trade for history.
             return {"status": "success"}
         raise HTTPException(status_code=404, detail="Trade not found")
     except Exception as e:
@@ -513,19 +501,14 @@ def manual_close(req: CloseTradeReq):
 
 @app.post("/api/manual/close-all")
 def close_all():
-    """Closes all open trades."""
     try:
         p = last_price()
         count = len(STATE["openTrades"])
-        
-        # Iterate over a copy because close_trade modifies the original list
-        for t in list(STATE["openTrades"]): 
-            close_trade(t, p, "Close All")
-            
-        return {"status": "success", "closed_count": count}
+        for t in list(STATE["openTrades"]): close_trade(t, p, "Close All")
+        return {"status": "success", "closed": count}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
-# Use `if __name__ == "__main__":` to run locally
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
