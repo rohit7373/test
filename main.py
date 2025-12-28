@@ -26,6 +26,7 @@ app.add_middleware(
 exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
 MONGO_URL = os.environ.get("MONGO_URL")
+VALID_TFS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w"]
 
 # --- DATABASE HANDLES ---
 db = None
@@ -76,35 +77,20 @@ class CloseTradeReq(BaseModel):
 
 def clean_data(data):
     """Aggressively cleans data to ensure valid JSON response."""
-    if data is None:
-        return None
-    
-    if isinstance(data, list):
-        return [clean_data(x) for x in data]
-    
+    if data is None: return None
+    if isinstance(data, list): return [clean_data(x) for x in data]
     if isinstance(data, dict):
         return {k: (str(v) if k == "_id" else clean_data(v)) for k, v in data.items()}
-    
-    if isinstance(data, ObjectId):
-        return str(data)
-    
+    if isinstance(data, ObjectId): return str(data)
     if isinstance(data, float):
-        if math.isnan(data) or math.isinf(data):
-            return None
+        if math.isnan(data) or math.isinf(data): return None
         return data
-
-    if isinstance(data, (np.integer, np.int64, np.int32)):
-        return int(data)
+    if isinstance(data, (np.integer, np.int64, np.int32)): return int(data)
     if isinstance(data, (np.floating, np.float64, np.float32)):
-        if np.isnan(data) or np.isinf(data):
-            return None
+        if np.isnan(data) or np.isinf(data): return None
         return float(data)
-    if isinstance(data, np.ndarray):
-        return clean_data(data.tolist())
-    
-    if isinstance(data, datetime):
-        return data.isoformat()
-
+    if isinstance(data, np.ndarray): return clean_data(data.tolist())
+    if isinstance(data, datetime): return data.isoformat()
     return data
 
 def update_db():
@@ -130,7 +116,6 @@ def fetch_candles(tf_key, limit=300):
         df = df[['time', 'open', 'high', 'low', 'close', 'rsi']].dropna()
         return df
     except Exception as e:
-        # print(f"Error fetching data for {tf_key}: {e}") # Suppress frequent errors
         return pd.DataFrame()
 
 def last_price():
@@ -140,8 +125,7 @@ def last_price():
 
 def pack_df_to_list(df): 
     """Converts a DataFrame to a list of dicts for FastAPI response."""
-    if df.empty:
-        return [] 
+    if df.empty: return [] 
     return df[["time","open","high","low","close","rsi"]].to_dict("records")
 
 def calculate_pnl():
@@ -259,9 +243,7 @@ def check_entry_signal(df_stf_f, df_stf_s, df_ltf_f, df_ltf_s):
     stf_short_cross = check_cross(stf_f_prev, stf_f, '<', stf_s_prev, stf_s)
 
     # 2. LTF Filter Check (LTF is in the direction of the trade)
-    # Check if LTF Fast > LTF Slow (Bullish filter)
     ltf_filter_bullish = check_condition(ltf_f, ltf_op, ltf_s)
-    # Check if LTF Slow > LTF Fast (Bearish filter) - Note: This assumes ltf_op is generally for the "desired" relationship
     ltf_filter_bearish = check_condition(ltf_s, ltf_op, ltf_f) 
     
     # 3. LTF Cross Check (Used for LTF_ONLY mode)
@@ -276,11 +258,11 @@ def check_entry_signal(df_stf_f, df_stf_s, df_ltf_f, df_ltf_s):
         # LONG: STF Cross UP AND LTF Filter is Bullish
         if stf_long_cross and ltf_filter_bullish:
             trade_allowed = True; side = "LONG"
-            logic_str = f"STF Cross UP AND LTF Filter ({ltf_op} Bullish)"
+            logic_str = f"STF Cross UP + LTF Filter ({ltf_op})"
         # SHORT: STF Cross DOWN AND LTF Filter is Bearish
         elif stf_short_cross and ltf_filter_bearish:
             trade_allowed = True; side = "SHORT"
-            logic_str = f"STF Cross DOWN AND LTF Filter ({ltf_op} Bearish)"
+            logic_str = f"STF Cross DOWN + LTF Filter ({ltf_op})"
 
     elif entry_mode == "STF_ONLY":
         if stf_long_cross:
@@ -335,6 +317,7 @@ def bot_loop():
             
             if STATE["running"]:
                 
+                # Bot should only trade if it has no auto-trades open
                 if not any(t.get('auto') for t in STATE["openTrades"]):
                     
                     df_stf_f = fetch_candles(BOT_CONFIG['stf1'], limit=50)
@@ -346,7 +329,6 @@ def bot_loop():
 
                     if side:
                         open_trade(side, current_price, logic)
-                        # print(f"BOT ENTRY: {side} @ {current_price:.2f} with Logic: {logic}")
 
             update_db() # Save State (wallet/running/config)
                 
@@ -395,19 +377,33 @@ threading.Thread(target=bot_loop, daemon=True).start()
 
 @app.get("/api/config")
 async def get_initial_config():
-    """NEW ENDPOINT: Serves the current BOT_CONFIG once for initial UI population."""
+    """Serves the current BOT_CONFIG once for initial UI population."""
     return JSONResponse(content=clean_data(BOT_CONFIG))
+    
+@app.get("/api/chart_data/{timeframe}")
+def chart_data(timeframe: str):
+    """
+    NEW ENDPOINT: Fetches candlestick and RSI data for a single requested timeframe 
+    for dynamic chart display.
+    """
+    if timeframe not in VALID_TFS:
+        raise HTTPException(status_code=400, detail="Invalid timeframe requested")
+            
+    df = fetch_candles(timeframe, limit=300)
+    return JSONResponse(content=clean_data({
+        "timeframe": timeframe,
+        "data": pack_df_to_list(df)
+    }))
 
 @app.get("/api/market")
 def market():
     """
-    FIX: Removed BOT_CONFIG from this response. 
-    It only sends volatile data (price, state, charts, trades).
+    FIX: Only sends volatile data (price, state, trades, history). 
+    Chart data is now fetched separately.
     """
     try:
-        # Simple caching
+        # Simple caching for high-frequency data
         if time.time() - CACHE["last_update"] < 3 and CACHE["data"] is not None:
-            # Only update volatile state/price in cached data
             cached_data = CACHE["data"].copy()
             cached_data["price"] = last_price()
             cached_data["state"] = clean_data({"running": STATE["running"], "wallet": STATE["wallet"], "unrealized": STATE["unrealized"]})
@@ -422,10 +418,6 @@ def market():
                 "wallet": STATE["wallet"],
                 "unrealized": STATE["unrealized"],
             },
-            "stf1": pack_df_to_list(fetch_candles(BOT_CONFIG["stf1"])),
-            "stf2": pack_df_to_list(fetch_candles(BOT_CONFIG["stf2"])),
-            "ltf1": pack_df_to_list(fetch_candles(BOT_CONFIG["ltf1"])),
-            "ltf2": pack_df_to_list(fetch_candles(BOT_CONFIG["ltf2"])),
             "openTrades": STATE["openTrades"],
             "history": STATE["history"]
         }
