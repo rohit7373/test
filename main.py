@@ -452,4 +452,120 @@ else:
             if "general_config" in saved: GENERAL_CONFIG.update(saved["general_config"])
             if "liq_config" in saved: LIQ_CONFIG.update(saved["liq_config"]) # Load Liquidity Config
         else:
-            state_collection.insert_one({"_id": "global_state", "wallet": 1000.0, "running": False, "buy_config":
+            state_collection.insert_one({"_id": "global_state", "wallet": 1000.0, "running": False, "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG})
+
+        STATE["openTrades"] = clean_data(list(trades_collection.find({})))
+        STATE["history"] = clean_data(list(history_collection.find().sort("time", -1).limit(100)))
+    except Exception as e: print(f"❌ DB Error: {e}")
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+# --- API ENDPOINTS ---
+
+@app.get("/api/config")
+async def get_initial_config():
+    return JSONResponse(content=clean_data({
+        "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, 
+        "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG,
+        "valid_tfs": VALID_TFS
+    }))
+    
+@app.get("/api/market")
+def market(
+    stf1_display: Optional[str] = GENERAL_CONFIG["stf1"], 
+    stf2_display: Optional[str] = GENERAL_CONFIG["stf2"],
+    ltf1_display: Optional[str] = GENERAL_CONFIG["ltf1"], 
+    ltf2_display: Optional[str] = GENERAL_CONFIG["ltf2"],
+    ):
+    try:
+        GENERAL_CONFIG["stf1"] = stf1_display
+        GENERAL_CONFIG["stf2"] = stf2_display
+        GENERAL_CONFIG["ltf1"] = ltf1_display
+        GENERAL_CONFIG["ltf2"] = ltf2_display
+        
+        current_tfs = set([stf1_display, stf2_display, ltf1_display, ltf2_display])
+        data_frames = {tf: fetch_candles(tf, limit=300) for tf in current_tfs if tf}
+        
+        data = {
+            "price": last_price(),
+            "stf1": pack_df_to_list(data_frames.get(stf1_display, pd.DataFrame())),
+            "stf2": pack_df_to_list(data_frames.get(stf2_display, pd.DataFrame())),
+            "ltf1": pack_df_to_list(data_frames.get(ltf1_display, pd.DataFrame())),
+            "ltf2": pack_df_to_list(data_frames.get(ltf2_display, pd.DataFrame())),
+            "config": {
+                "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, 
+                "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG
+            },
+            "state": STATE,
+            "openTrades": STATE["openTrades"],
+            "history": STATE["history"]
+        }
+        return JSONResponse(content=clean_data(data))
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
+
+@app.post("/api/start")
+def start(req: BotStartReq):
+    try:
+        if STATE["running"]: raise HTTPException(status_code=400, detail="Bot is already running")
+        if req.qty <= 0: raise HTTPException(status_code=400, detail="Quantity must be > 0")
+
+        global GENERAL_CONFIG, BUY_CONFIG, SELL_CONFIG, LIQ_CONFIG
+        
+        GENERAL_CONFIG.update({"qty": req.qty, "fee": req.fee, "tp": req.tp, "sl": req.sl})
+        
+        BUY_CONFIG.update({
+            "stf1": req.buy_stf1, "stf2": req.buy_stf2, "ltf1": req.buy_ltf1, "ltf2": req.buy_ltf2,
+            "stf_logic": req.buy_stf_logic, "ltf_logic": req.buy_ltf_logic, "entry_mode": req.buy_entry_mode,
+        })
+        SELL_CONFIG.update({
+            "stf1": req.sell_stf1, "stf2": req.sell_stf2, "ltf1": req.sell_ltf1, "ltf2": req.sell_ltf2,
+            "stf_logic": req.sell_stf_logic, "ltf_logic": req.sell_ltf_logic, "entry_mode": req.sell_entry_mode,
+        })
+        
+        # Update Liquidity Config
+        # If frontend didn't pass these (old version), use defaults or current
+        if req.liq_ext_len:
+            LIQ_CONFIG.update({
+                "enabled": True, # Implicit enable if sent from that tab? Or explicit param
+                "ext_len": req.liq_ext_len, "int_len": req.liq_int_len,
+                "trade_int": req.liq_trade_int, "tf": "5m" # Defaulting to 5m scan for now
+            })
+            
+        STATE["running"] = True
+        update_db()
+        return clean_data({"status": "started", "config": {"buy": BUY_CONFIG, "liq": LIQ_CONFIG}})
+    except Exception as e: return JSONResponse(status_code=500, detail=str(e))
+
+@app.post("/api/stop")
+def stop():
+    try:
+        STATE["running"] = False
+        update_db()
+        return {"status": "stopped"}
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
+
+@app.post("/api/manual/order")
+def manual_order(order: ManualOrder):
+    try:
+        price = last_price()
+        if not price: raise HTTPException(status_code=500, detail="No price")
+        open_trade(order.side, price, "Manual")
+        return clean_data({"status": "success"})
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
+
+@app.post("/api/manual/close")
+def manual_close(req: CloseTradeReq):
+    t = next((x for x in STATE["openTrades"] if x["id"] == req.id), None)
+    if t:
+        close_trade(t, last_price(), "Manual Close")
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="Trade not found")
+
+@app.post("/api/manual/close-all")
+def close_all():
+    p = last_price()
+    for t in list(STATE["openTrades"]): close_trade(t, p, "Close All")
+    return {"status": "success"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
