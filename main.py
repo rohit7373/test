@@ -224,8 +224,11 @@ def close_trade(t, price, reason):
         STATE["history"].append(h)
         STATE["openTrades"].remove(t)
         
-        if trades_collection is not None: try: trades_collection.delete_one({"id": t["id"]})
-        except: pass
+   if trades_collection is not None: 
+    try: 
+        trades_collection.delete_one({"id": t["id"]})
+    except: 
+        pass
         if history_collection is not None: try: history_collection.insert_one(h.copy())
         except: pass
         update_db()
