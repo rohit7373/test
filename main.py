@@ -26,35 +26,33 @@ app.add_middleware(
 exchange = ccxt.binance({"enableRateLimit": True})
 SYMBOL = "BTC/USDT"
 MONGO_URL = os.environ.get("MONGO_URL")
-# Full list of valid TFs
 VALID_TFS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w"]
 
-
-# --- DUAL BOT CONFIGURATION ---
-# Default logic settings for a LONG (BUY) trade
+# --- DUAL BOT CONFIGURATION (RSI) ---
 BUY_CONFIG = {
-    "stf1": "5m", "stf2": "15m",
-    "ltf1": "1h", "ltf2": "4h",
-    "stf_logic": ">",       # STF1 > STF2 (Buy Cross)
-    "ltf_logic": ">",       # LTF1 > LTF2 (Buy Filter)
-    "entry_mode": "BOTH",   # Options: "STF_ONLY", "LTF_ONLY", "BOTH"
+    "stf1": "5m", "stf2": "15m", "ltf1": "1h", "ltf2": "4h",
+    "stf_logic": ">", "ltf_logic": ">", "entry_mode": "BOTH",
 }
-# Default logic settings for a SHORT (SELL) trade
 SELL_CONFIG = {
-    "stf1": "5m", "stf2": "15m",
-    "ltf1": "1h", "ltf2": "4h",
-    "stf_logic": "<",       # STF1 < STF2 (Sell Cross)
-    "ltf_logic": "<",       # LTF1 < LTF2 (Sell Filter)
-    "entry_mode": "BOTH",
+    "stf1": "5m", "stf2": "15m", "ltf1": "1h", "ltf2": "4h",
+    "stf_logic": "<", "ltf_logic": "<", "entry_mode": "BOTH",
 }
-# General Settings (applies to both Buy and Sell)
+
+# --- NEW: LIQUIDITY CONFIGURATION ---
+LIQ_CONFIG = {
+    "enabled": False,       # Master switch for Liquidity Strategy
+    "ext_len": 20,          # External Structure Length
+    "int_len": 5,           # Internal Structure Length
+    "trade_int": False,     # Trade Internal Sweeps?
+    "tf": "5m"              # Timeframe to scan for liquidity (default 5m)
+}
+
+# General Settings
 GENERAL_CONFIG = {
     "qty": 0.01,
-    "fee": 0.1,             # Fee rate in percent
-    "tp": None,             # Auto TP (price)
-    "sl": None,             # Auto SL (price)
-    # Default chart display TFs (used if not loaded from DB)
-    "stf1": "5m", "stf2": "15m", "ltf1": "1h", "ltf2": "4h",
+    "fee": 0.1,
+    "tp": None, "sl": None,
+    "stf1": "5m", "stf2": "15m", "ltf1": "1h", "ltf2": "4h", # Display defaults
 }
 
 
@@ -73,11 +71,7 @@ STATE = {
     "history": []     
 }
 
-# Caching for market data to reduce CCXT API calls
-CACHE = {"last_update": 0, "data": None}
-
-
-# --- Pydantic Models for Requests ---
+# --- Pydantic Models ---
 class BotStartReq(BaseModel):
     # Buy Config
     buy_stf1: str; buy_stf2: str; buy_ltf1: str; buy_ltf2: str
@@ -85,6 +79,11 @@ class BotStartReq(BaseModel):
     # Sell Config
     sell_stf1: str; sell_stf2: str; sell_ltf1: str; sell_ltf2: str
     sell_stf_logic: str; sell_ltf_logic: str; sell_entry_mode: str
+    # Liquidity Config (NEW)
+    liq_enabled: Optional[bool] = False
+    liq_ext_len: Optional[int] = 20
+    liq_int_len: Optional[int] = 5
+    liq_trade_int: Optional[bool] = False
     # General Config
     qty: float; fee: float
     sl: Optional[float] = None; tp: Optional[float] = None
@@ -117,9 +116,7 @@ def clean_data(data):
 
 def update_db():
     """Saves state and configurations to MongoDB."""
-    global BUY_CONFIG, SELL_CONFIG, GENERAL_CONFIG
-    
-    # NOTE: GENERAL_CONFIG fields for chart display TFs are updated in /api/market
+    global BUY_CONFIG, SELL_CONFIG, GENERAL_CONFIG, LIQ_CONFIG
     
     if state_collection is not None:
         try:
@@ -130,7 +127,8 @@ def update_db():
                     "running": STATE["running"], 
                     "general_config": GENERAL_CONFIG,
                     "buy_config": BUY_CONFIG,
-                    "sell_config": SELL_CONFIG
+                    "sell_config": SELL_CONFIG,
+                    "liq_config": LIQ_CONFIG
                 }},
                 upsert=True
             )
@@ -138,32 +136,27 @@ def update_db():
             print(f"DB Update Failed: {e}")
 
 def fetch_candles(tf_key, limit=300):
-    """Fetch and prepare OHLCV data with RSI, returning a DataFrame."""
     if tf_key not in VALID_TFS: return pd.DataFrame()
     try:
         ohlcv = exchange.fetch_ohlcv(SYMBOL, tf_key, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-        df['time'] = df['time'] // 1000  # Convert milliseconds to seconds
+        df['time'] = df['time'] // 1000
         df.ta.rsi(length=14, append=True)
         df.rename(columns={'RSI_14': 'rsi'}, inplace=True)
         df = df[['time', 'open', 'high', 'low', 'close', 'rsi']].dropna()
         return df
     except Exception as e:
-        # print(f"CCXT Fetch Error for {tf_key}: {e}") # Suppress frequent errors
         return pd.DataFrame()
 
 def last_price():
-    """Fetches the current price of the trading symbol."""
     try: return float(exchange.fetch_ticker(SYMBOL)["last"])
     except: return 0.0
 
 def pack_df_to_list(df): 
-    """Converts a DataFrame to a list of dicts for FastAPI response."""
     if df.empty: return [] 
     return df[["time","open","high","low","close","rsi"]].to_dict("records")
 
 def calculate_pnl():
-    """Calculates total unrealized PnL for all open trades, including fees."""
     pnl = 0.0
     current_price = last_price()
     if not current_price: return 0.0
@@ -173,15 +166,14 @@ def calculate_pnl():
         size = t['size']
         fee_rate = t.get('fee_rate', GENERAL_CONFIG['fee']) / 100.0
         
-        # Estimate total fee cost (entry + exit)
+        # Calculate total fee cost (entry + exit)
         total_fee_cost = (entry * size * fee_rate) + (current_price * size * fee_rate)
         
         if t['side'] == 'LONG':
             unrealized_pnl = (current_price - entry) * size - total_fee_cost
-        else: # SHORT
+        else:
             unrealized_pnl = (entry - current_price) * size - total_fee_cost
 
-        # Update PnL in the open trade state (for API response)
         t['pnl'] = unrealized_pnl
         pnl += unrealized_pnl
         
@@ -189,27 +181,19 @@ def calculate_pnl():
     return pnl
 
 def check_condition(val1, op, val2):
-    """Checks the current filter condition (RSI1 vs RSI2)."""
     if op == ">": return val1 > val2
     if op == "<": return val1 < val2
     return False
 
 def check_cross(prev1, curr1, op, prev2, curr2):
-    """Checks for a cross signal (RSI1 crosses RSI2)."""
-    if op == ">":
-        # Bullish/Long Cross: prev1 <= prev2 AND curr1 > curr2
-        return (prev1 <= prev2) and (curr1 > curr2)
-    if op == "<":
-        # Bearish/Short Cross: prev1 >= prev2 AND curr1 < curr2
-        return (prev1 >= prev2) and (curr1 < curr2)
+    if op == ">": return (prev1 <= prev2) and (curr1 > curr2)
+    if op == "<": return (prev1 >= prev2) and (curr1 < curr2)
     return False
 
 def open_trade(side, price, logic="Manual"):
-    """Opens a new trade and saves it to state and DB."""
     t = {
         "id": str(uuid.uuid4())[:8], "side": side, "size": float(GENERAL_CONFIG["qty"]),
         "entryPrice": float(price), 
-        # Use current global SL/TP as trade-specific limits
         "sl": GENERAL_CONFIG.get("sl"), "tp": GENERAL_CONFIG.get("tp"),
         "fee_rate": float(GENERAL_CONFIG["fee"]), "pnl": 0.0, "auto": True, "logic": logic,
         "time": datetime.now().isoformat() 
@@ -222,52 +206,36 @@ def open_trade(side, price, logic="Manual"):
     update_db()
 
 def close_trade(t, price, reason):
-    """Closes an existing trade, calculates realized PnL, and updates history."""
     if t in STATE["openTrades"]:
-        
         entry = t['entryPrice']
         size = t['size']
         fee_rate = t.get('fee_rate', GENERAL_CONFIG['fee']) / 100.0
-
-        # Total fee calculation (entry fee + exit fee)
         total_fee_cost = (entry * size * fee_rate) + (price * size * fee_rate)
         
-        if t['side'] == 'LONG':
-            realized_pnl = (price - entry) * size - total_fee_cost
-        else: # SHORT
-            realized_pnl = (entry - price) * size - total_fee_cost
+        if t['side'] == 'LONG': realized_pnl = (price - entry) * size - total_fee_cost
+        else: realized_pnl = (entry - price) * size - total_fee_cost
 
         STATE["wallet"] += realized_pnl
-        
-        # History record
         h = {
             "time": datetime.now().isoformat(), "side": t["side"],
             "entryPrice": t["entryPrice"], "exitPrice": float(price), "qty": t["size"],
             "realizedPnl": realized_pnl, "logic": t.get("logic", "N/A"), "reason": reason
         }
         STATE["history"].append(h)
-        
-        # Remove from openTrades
         STATE["openTrades"].remove(t)
         
-        # DB Updates
-        if trades_collection is not None: 
-            try: trades_collection.delete_one({"id": t["id"]})
-            except: pass
-        if history_collection is not None:
-            try: history_collection.insert_one(h.copy())
-            except: pass
+        if trades_collection is not None: try: trades_collection.delete_one({"id": t["id"]})
+        except: pass
+        if history_collection is not None: try: history_collection.insert_one(h.copy())
+        except: pass
         update_db()
 
-# --- CORE ENTRY LOGIC CHECK ---
-def check_entry_signal(config, df_stf_f, df_stf_s, df_ltf_f, df_ltf_s, side):
-    """Checks for the entry signal based on a specific (Buy or Sell) config."""
+# --- RSI STRATEGY LOGIC ---
+def check_rsi_signal(config, df_stf_f, df_stf_s, df_ltf_f, df_ltf_s, side):
     min_len = 2
-    if any(len(df) < min_len for df in [df_stf_f, df_stf_s, df_ltf_f, df_ltf_s]):
-        return False, None
+    if any(len(df) < min_len for df in [df_stf_f, df_stf_s, df_ltf_f, df_ltf_s]): return False, None
 
     try:
-        # Get current and previous RSI values
         stf_f, stf_s = df_stf_f["rsi"].iloc[-1], df_stf_s["rsi"].iloc[-1]
         stf_f_prev, stf_s_prev = df_stf_f["rsi"].iloc[-2], df_stf_s["rsi"].iloc[-2]
         ltf_f, ltf_s = df_ltf_f["rsi"].iloc[-1], df_ltf_s["rsi"].iloc[-1]
@@ -275,67 +243,102 @@ def check_entry_signal(config, df_stf_f, df_stf_s, df_ltf_f, df_ltf_s, side):
         
         if math.isnan(stf_f) or math.isnan(ltf_f): return False, None
         
-        stf_op = config["stf_logic"]
-        ltf_op = config["ltf_logic"]
+        stf_op, ltf_op = config["stf_logic"], config["ltf_logic"]
         entry_mode = config["entry_mode"]
         
-        # --- Evaluate Conditions ---
-        
-        # 1. STF Entry Cross Check
         stf_cross = check_cross(stf_f_prev, stf_f, stf_op, stf_s_prev, stf_s)
-
-        # 2. LTF Filter Check (LTF is in the direction of the trade)
         ltf_filter = check_condition(ltf_f, ltf_op, ltf_s)
-        
-        # 3. LTF Cross Check (Used for LTF_ONLY mode)
         ltf_cross = check_cross(ltf_f_prev, ltf_f, ltf_op, ltf_s_prev, ltf_s)
 
-        
         trade_allowed = False
-        
-        if entry_mode == "BOTH":
-            trade_allowed = stf_cross and ltf_filter
-        elif entry_mode == "STF_ONLY":
-            trade_allowed = stf_cross
-        elif entry_mode == "LTF_ONLY":
-            trade_allowed = ltf_cross
+        if entry_mode == "BOTH": trade_allowed = stf_cross and ltf_filter
+        elif entry_mode == "STF_ONLY": trade_allowed = stf_cross
+        elif entry_mode == "LTF_ONLY": trade_allowed = ltf_cross
 
         if trade_allowed:
-            logic_str = f"{side} | Mode:{entry_mode} | STF:{config['stf1']}{stf_op}{config['stf2']} | LTF:{config['ltf1']}{ltf_op}{config['ltf2']}"
-        else:
-            logic_str = None
-        
-        return trade_allowed, logic_str
-
+            logic_str = f"RSI {side} | M:{entry_mode}"
+            return True, logic_str
+        return False, None
     except Exception as e:
-        print(f"Signal Check Error for {side}: {e}")
+        print(f"RSI Check Error: {e}")
         return False, None
 
+# --- NEW: LIQUIDITY SWEEP LOGIC ---
+def find_pivots(df, length):
+    """Identifies High and Low pivots in the dataframe."""
+    pivots = []
+    # Iterate through candles, respecting the length lookback/lookforward
+    # Note: A pivot at index 'i' is only confirmed at index 'i + length'
+    # We scan up to len(df) - length
+    if len(df) < length * 2 + 1: return []
 
-def check_exit_signal(current_price):
-    """Checks for TP/SL signals based on current price for all open trades."""
-    trades_to_close = []
+    for i in range(length, len(df) - length):
+        # Check High
+        current_high = df['high'].iloc[i]
+        is_high = True
+        # Check left and right neighbors
+        for j in range(1, length + 1):
+            if df['high'].iloc[i-j] > current_high or df['high'].iloc[i+j] > current_high:
+                is_high = False; break
+        if is_high: pivots.append({'type': 'HIGH', 'price': current_high, 'index': i})
+
+        # Check Low
+        current_low = df['low'].iloc[i]
+        is_low = True
+        for j in range(1, length + 1):
+            if df['low'].iloc[i-j] < current_low or df['low'].iloc[i+j] < current_low:
+                is_low = False; break
+        if is_low: pivots.append({'type': 'LOW', 'price': current_low, 'index': i})
+        
+    return pivots
+
+def check_liquidity_signal(df, config):
+    """
+    Checks if the *current* candle has swept a valid, unbroken liquidity level.
+    """
+    if not config.get("enabled", False): return None, None, None
+
+    # Determine which structures to check
+    structures_to_check = [("EXT", config["ext_len"])]
+    if config.get("trade_int", False):
+        structures_to_check.append(("INT", config["int_len"]))
+
+    current_price_obj = df.iloc[-1] # Current live candle
+    curr_high = current_price_obj['high']
+    curr_low = current_price_obj['low']
     
-    for t in STATE["openTrades"]:
-        exit_reason = None
+    # Iterate over EXT then INT
+    for struct_name, length in structures_to_check:
+        pivots = find_pivots(df[:-1], length) # Exclude current candle from forming a pivot
         
-        # Use General SL/TP if trade-specific ones are not set or 0/None
-        sl = t.get('sl') if t.get('sl') is not None and t.get('sl') > 0 else GENERAL_CONFIG.get('sl')
-        tp = t.get('tp') if t.get('tp') is not None and t.get('tp') > 0 else GENERAL_CONFIG.get('tp')
-        
-        if sl is not None and sl > 0:
-            if t['side'] == 'LONG' and current_price <= sl: exit_reason = "SL Hit"
-            elif t['side'] == 'SHORT' and current_price >= sl: exit_reason = "SL Hit"
+        # Check Highs (Liquidity at Top -> Sweep -> Short)
+        highs = [p for p in pivots if p['type'] == 'HIGH']
+        for h in highs:
+            # Is this line still active? (Has price broken it between formation and now?)
+            # Look from pivot index + 1 up to current candle index - 1
+            broken = False
+            subset = df['high'].iloc[h['index']+1 : -1] # Highs between pivot and now
+            if not subset.empty and subset.max() > h['price']: broken = True
+            
+            if not broken:
+                # Check if CURRENT candle broke it
+                if curr_high > h['price']:
+                    # SWEEP DETECTED! Reversal Short
+                    return "SHORT", f"Liq Sweep {struct_name} High", h['price']
 
-        if exit_reason is None and tp is not None and tp > 0:
-            if t['side'] == 'LONG' and current_price >= tp: exit_reason = "TP Hit"
-            elif t['side'] == 'SHORT' and current_price <= tp: exit_reason = "TP Hit"
-        
-        if exit_reason:
-            trades_to_close.append((t, exit_reason))
-
-    for t, reason in trades_to_close:
-        close_trade(t, current_price, reason)
+        # Check Lows (Liquidity at Bottom -> Sweep -> Long)
+        lows = [p for p in pivots if p['type'] == 'LOW']
+        for l in lows:
+            broken = False
+            subset = df['low'].iloc[l['index']+1 : -1]
+            if not subset.empty and subset.min() < l['price']: broken = True
+            
+            if not broken:
+                if curr_low < l['price']:
+                    # SWEEP DETECTED! Reversal Long
+                    return "LONG", f"Liq Sweep {struct_name} Low", l['price']
+                    
+    return None, None, None
 
 
 # --- BOT LOOP ---
@@ -344,58 +347,80 @@ def bot_loop():
         try:
             current_price = last_price()
             if not current_price:
-                time.sleep(3)
-                continue
+                time.sleep(3); continue
 
             calculate_pnl()
             check_exit_signal(current_price)
             
             if STATE["running"]:
-                
-                # Bot should only trade if it has no auto-trades open
-                # This prevents rapid-fire trades and conflicting auto trades
+                # Prevent conflicting auto trades
                 if not any(t.get('auto') for t in STATE["openTrades"]):
                     
-                    # Consolidate TFs to fetch only unique ones once
-                    tfs_to_fetch = set([
+                    # 1. Fetch Data
+                    # We combine RSI TFs + Liquidity TFs (default 5m for Liq)
+                    req_tfs = set([
                         BUY_CONFIG["stf1"], BUY_CONFIG["stf2"], BUY_CONFIG["ltf1"], BUY_CONFIG["ltf2"],
                         SELL_CONFIG["stf1"], SELL_CONFIG["stf2"], SELL_CONFIG["ltf1"], SELL_CONFIG["ltf2"],
+                        LIQ_CONFIG.get("tf", "5m")
                     ])
-                    # Fetch and cache all required dataframes
-                    dfs = {tf: fetch_candles(tf, limit=50) for tf in tfs_to_fetch}
+                    dfs = {tf: fetch_candles(tf, limit=300) for tf in req_tfs}
                     
-                    # --- Check BUY Signal ---
-                    buy_trigger, buy_logic = check_entry_signal(
-                        BUY_CONFIG, 
-                        dfs.get(BUY_CONFIG["stf1"], pd.DataFrame()), dfs.get(BUY_CONFIG["stf2"], pd.DataFrame()),
-                        dfs.get(BUY_CONFIG["ltf1"], pd.DataFrame()), dfs.get(BUY_CONFIG["ltf2"], pd.DataFrame()),
-                        "LONG"
-                    )
-                    
-                    # --- Check SELL Signal ---
-                    sell_trigger, sell_logic = check_entry_signal(
-                        SELL_CONFIG, 
-                        dfs.get(SELL_CONFIG["stf1"], pd.DataFrame()), dfs.get(SELL_CONFIG["stf2"], pd.DataFrame()),
-                        dfs.get(SELL_CONFIG["ltf1"], pd.DataFrame()), dfs.get(SELL_CONFIG["ltf2"], pd.DataFrame()),
-                        "SHORT"
-                    )
+                    signal_found = False
 
-                    if buy_trigger and not sell_trigger:
-                        open_trade("LONG", current_price, buy_logic)
-                    elif sell_trigger and not buy_trigger:
-                        open_trade("SHORT", current_price, sell_logic)
-                    # If both are true, no trade is opened (conflicting signals)
+                    # 2. CHECK LIQUIDITY STRATEGY (Priority)
+                    if LIQ_CONFIG.get("enabled"):
+                        liq_df = dfs.get(LIQ_CONFIG.get("tf", "5m"))
+                        if liq_df is not None and not liq_df.empty:
+                            liq_side, liq_logic, liq_level = check_liquidity_signal(liq_df, LIQ_CONFIG)
+                            if liq_side:
+                                open_trade(liq_side, current_price, liq_logic)
+                                signal_found = True
 
-            update_db() # Save State (wallet/running/config)
-                
-            time.sleep(5) # Poll every 5 seconds
+                    # 3. CHECK RSI STRATEGY (Only if no Liquidity signal)
+                    if not signal_found:
+                        # Check Buy
+                        buy_trig, buy_log = check_rsi_signal(
+                            BUY_CONFIG, 
+                            dfs.get(BUY_CONFIG["stf1"]), dfs.get(BUY_CONFIG["stf2"]),
+                            dfs.get(BUY_CONFIG["ltf1"]), dfs.get(BUY_CONFIG["ltf2"]), "LONG"
+                        )
+                        # Check Sell
+                        sell_trig, sell_log = check_rsi_signal(
+                            SELL_CONFIG, 
+                            dfs.get(SELL_CONFIG["stf1"]), dfs.get(SELL_CONFIG["stf2"]),
+                            dfs.get(SELL_CONFIG["ltf1"]), dfs.get(SELL_CONFIG["ltf2"]), "SHORT"
+                        )
+
+                        if buy_trig and not sell_trig: open_trade("LONG", current_price, buy_log)
+                        elif sell_trig and not buy_trig: open_trade("SHORT", current_price, sell_log)
+
+            update_db()
+            time.sleep(5)
 
         except Exception as e:
             print(f"Bot Loop Error: {e}")
             time.sleep(5)
 
-# --- DB CONNECTION (Load Dual Config) ---
+def check_exit_signal(current_price):
+    trades_to_close = []
+    for t in STATE["openTrades"]:
+        exit_reason = None
+        sl = t.get('sl') if t.get('sl') and t.get('sl') > 0 else GENERAL_CONFIG.get('sl')
+        tp = t.get('tp') if t.get('tp') and t.get('tp') > 0 else GENERAL_CONFIG.get('tp')
+        
+        if sl and sl > 0:
+            if t['side'] == 'LONG' and current_price <= sl: exit_reason = "SL Hit"
+            elif t['side'] == 'SHORT' and current_price >= sl: exit_reason = "SL Hit"
+        if not exit_reason and tp and tp > 0:
+            if t['side'] == 'LONG' and current_price >= tp: exit_reason = "TP Hit"
+            elif t['side'] == 'SHORT' and current_price <= tp: exit_reason = "TP Hit"
+        
+        if exit_reason: trades_to_close.append((t, exit_reason))
 
+    for t, reason in trades_to_close: close_trade(t, current_price, reason)
+
+
+# --- DB CONNECTION ---
 if not MONGO_URL:
     print("⚠️ MONGO_URL not found. Using In-Memory Mode.")
 else:
@@ -407,51 +432,20 @@ else:
         history_collection = db.history
         print("✅ MongoDB Connected")
         
-        # Load State
         saved = state_collection.find_one({"_id": "global_state"})
         if saved:
             STATE["wallet"] = saved.get("wallet", 1000.0)
             STATE["running"] = saved.get("running", False)
-            
-            # Load Dual Configs (New Format)
             if "buy_config" in saved: BUY_CONFIG.update(saved["buy_config"])
             if "sell_config" in saved: SELL_CONFIG.update(saved["sell_config"])
             if "general_config" in saved: GENERAL_CONFIG.update(saved["general_config"])
-            
-            # ------------------------------------------------------------------
-            # REVISED MIGRATION LOGIC (if coming from a single config older version)
-            # ------------------------------------------------------------------
-            elif "config" in saved: 
-                old_cfg = saved["config"]
-                
-                # 1. Migrate General Settings
-                GENERAL_CONFIG_KEYS = ["qty", "fee", "tp", "sl"]
-                for k in GENERAL_CONFIG_KEYS:
-                    if k in old_cfg: GENERAL_CONFIG[k] = old_cfg[k]
-                
-                # 2. Migrate Logic Settings (Applies to both Buy and Sell)
-                # Note: We assume the old logic applies to both buy and sell sides for simplicity
-                LOGIC_CONFIG_KEYS = ["stf1", "stf2", "ltf1", "ltf2", "stf_logic", "ltf_logic", "entry_mode"]
-                logic_update = {}
-                for k in LOGIC_CONFIG_KEYS:
-                    if k in old_cfg: logic_update[k] = old_cfg[k]
-                    
-                BUY_CONFIG.update(logic_update)
-                SELL_CONFIG.update(logic_update)
-            # ------------------------------------------------------------------
-            # END OF REVISED MIGRATION LOGIC
-            # ------------------------------------------------------------------
-
+            if "liq_config" in saved: LIQ_CONFIG.update(saved["liq_config"]) # Load Liquidity Config
         else:
-            # Initialize state if no global state exists
-            state_collection.insert_one({"_id": "global_state", "wallet": 1000.0, "running": False, "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, "general_config": GENERAL_CONFIG})
+            state_collection.insert_one({"_id": "global_state", "wallet": 1000.0, "running": False, "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG})
 
-        # Load Trades
         STATE["openTrades"] = clean_data(list(trades_collection.find({})))
         STATE["history"] = clean_data(list(history_collection.find().sort("time", -1).limit(100)))
-
-    except Exception as e:
-        print(f"❌ DB Error: {e}")
+    except Exception as e: print(f"❌ DB Error: {e}")
 
 threading.Thread(target=bot_loop, daemon=True).start()
 
@@ -459,11 +453,9 @@ threading.Thread(target=bot_loop, daemon=True).start()
 
 @app.get("/api/config")
 async def get_initial_config():
-    """Serves all configurations once for initial UI population."""
     return JSONResponse(content=clean_data({
-        "buy_config": BUY_CONFIG,
-        "sell_config": SELL_CONFIG,
-        "general_config": GENERAL_CONFIG,
+        "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, 
+        "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG,
         "valid_tfs": VALID_TFS
     }))
     
@@ -474,22 +466,14 @@ def market(
     ltf1_display: Optional[str] = GENERAL_CONFIG["ltf1"], 
     ltf2_display: Optional[str] = GENERAL_CONFIG["ltf2"],
     ):
-    """
-    Sends volatile data (price, state, trades, history) and 
-    dataframes for the TFs requested by the frontend for charting.
-    """
     try:
-        # 1. Update GENERAL_CONFIG with the TFs requested by the frontend for display
-        # This ensures the DB saves the last viewed TFs
         GENERAL_CONFIG["stf1"] = stf1_display
         GENERAL_CONFIG["stf2"] = stf2_display
         GENERAL_CONFIG["ltf1"] = ltf1_display
         GENERAL_CONFIG["ltf2"] = ltf2_display
         
         current_tfs = set([stf1_display, stf2_display, ltf1_display, ltf2_display])
-        
-        # 2. Fetch data for the four current display TFs
-        data_frames = {tf: fetch_candles(tf, limit=300) for tf in current_tfs if tf is not None}
+        data_frames = {tf: fetch_candles(tf, limit=300) for tf in current_tfs if tf}
         
         data = {
             "price": last_price(),
@@ -498,65 +482,48 @@ def market(
             "ltf1": pack_df_to_list(data_frames.get(ltf1_display, pd.DataFrame())),
             "ltf2": pack_df_to_list(data_frames.get(ltf2_display, pd.DataFrame())),
             "config": {
-                "buy_config": BUY_CONFIG,
-                "sell_config": SELL_CONFIG,
-                "general_config": GENERAL_CONFIG,
+                "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, 
+                "general_config": GENERAL_CONFIG, "liq_config": LIQ_CONFIG
             },
             "state": STATE,
             "openTrades": STATE["openTrades"],
             "history": STATE["history"]
         }
-        
-        clean_response = clean_data(data)
-        return JSONResponse(content=clean_response)
-
-    except Exception as e:
-        print(f"Market Endpoint Error: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+        return JSONResponse(content=clean_data(data))
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/start")
 def start(req: BotStartReq):
     try:
-        if STATE["running"]:
-            raise HTTPException(status_code=400, detail="Bot is already running")
-            
-        # 1. Validate General Config
-        if req.qty <= 0: raise HTTPException(status_code=400, detail="Quantity must be greater than 0")
+        if STATE["running"]: raise HTTPException(status_code=400, detail="Bot is already running")
+        if req.qty <= 0: raise HTTPException(status_code=400, detail="Quantity must be > 0")
 
-        # 2. Update General Config
-        global GENERAL_CONFIG
-        GENERAL_CONFIG.update({
-            "qty": req.qty, "fee": req.fee, 
-            "tp": req.tp, "sl": req.sl
-        })
+        global GENERAL_CONFIG, BUY_CONFIG, SELL_CONFIG, LIQ_CONFIG
         
-        # 3. Update Buy Config
-        global BUY_CONFIG
-        if req.buy_stf_logic not in (">", "<") or req.buy_ltf_logic not in (">", "<"):
-             raise HTTPException(status_code=400, detail="Buy logic operators must be '>' or '<'")
-        if req.buy_entry_mode not in ("STF_ONLY", "LTF_ONLY", "BOTH"):
-             raise HTTPException(status_code=400, detail="Buy entry mode must be 'STF_ONLY', 'LTF_ONLY', or 'BOTH'")
+        GENERAL_CONFIG.update({"qty": req.qty, "fee": req.fee, "tp": req.tp, "sl": req.sl})
+        
         BUY_CONFIG.update({
             "stf1": req.buy_stf1, "stf2": req.buy_stf2, "ltf1": req.buy_ltf1, "ltf2": req.buy_ltf2,
             "stf_logic": req.buy_stf_logic, "ltf_logic": req.buy_ltf_logic, "entry_mode": req.buy_entry_mode,
         })
-
-        # 4. Update Sell Config
-        global SELL_CONFIG
-        if req.sell_stf_logic not in (">", "<") or req.sell_ltf_logic not in (">", "<"):
-             raise HTTPException(status_code=400, detail="Sell logic operators must be '>' or '<'")
-        if req.sell_entry_mode not in ("STF_ONLY", "LTF_ONLY", "BOTH"):
-             raise HTTPException(status_code=400, detail="Sell entry mode must be 'STF_ONLY', 'LTF_ONLY', or 'BOTH'")
         SELL_CONFIG.update({
             "stf1": req.sell_stf1, "stf2": req.sell_stf2, "ltf1": req.sell_ltf1, "ltf2": req.sell_ltf2,
             "stf_logic": req.sell_stf_logic, "ltf_logic": req.sell_ltf_logic, "entry_mode": req.sell_entry_mode,
         })
         
+        # Update Liquidity Config
+        # If frontend didn't pass these (old version), use defaults or current
+        if req.liq_ext_len:
+            LIQ_CONFIG.update({
+                "enabled": True, # Implicit enable if sent from that tab? Or explicit param
+                "ext_len": req.liq_ext_len, "int_len": req.liq_int_len,
+                "trade_int": req.liq_trade_int, "tf": "5m" # Defaulting to 5m scan for now
+            })
+            
         STATE["running"] = True
         update_db()
-        return clean_data({"status": "started", "buy_config": BUY_CONFIG, "sell_config": SELL_CONFIG, "general_config": GENERAL_CONFIG})
-    except Exception as e:
-        return JSONResponse(status_code=500, detail=str(e))
+        return clean_data({"status": "started", "config": {"buy": BUY_CONFIG, "liq": LIQ_CONFIG}})
+    except Exception as e: return JSONResponse(status_code=500, detail=str(e))
 
 @app.post("/api/stop")
 def stop():
@@ -564,52 +531,30 @@ def stop():
         STATE["running"] = False
         update_db()
         return {"status": "stopped"}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/manual/order")
 def manual_order(order: ManualOrder):
     try:
         price = last_price()
-        if not price: raise HTTPException(status_code=500, detail="Could not fetch current price.")
-             
-        t = {
-            "id": str(uuid.uuid4())[:8], "side": order.side, "size": float(order.qty),
-            "entryPrice": price, "sl": order.sl, "tp": order.tp, "fee_rate": GENERAL_CONFIG["fee"],
-            "pnl": 0.0, "logic": "Manual", "auto": False, "time": datetime.now().isoformat()
-        }
-        STATE["openTrades"].append(t)
-        
-        if trades_collection is not None: 
-            try: trades_collection.insert_one(t.copy())
-            except: pass
-            
-        update_db()
-        return clean_data({"status": "success", "trade": t})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+        if not price: raise HTTPException(status_code=500, detail="No price")
+        open_trade(order.side, price, "Manual")
+        return clean_data({"status": "success"})
+    except Exception as e: return JSONResponse(status_code=500, content={"detail": str(e)})
 
 @app.post("/api/manual/close")
 def manual_close(req: CloseTradeReq):
-    try:
-        t = next((x for x in STATE["openTrades"] if x["id"] == req.id), None)
-        if t:
-            close_trade(t, last_price(), "Manual Close")
-            return {"status": "success"}
-        raise HTTPException(status_code=404, detail="Trade not found")
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
+    t = next((x for x in STATE["openTrades"] if x["id"] == req.id), None)
+    if t:
+        close_trade(t, last_price(), "Manual Close")
+        return {"status": "success"}
+    raise HTTPException(status_code=404, detail="Trade not found")
 
 @app.post("/api/manual/close-all")
 def close_all():
-    try:
-        p = last_price()
-        count = len(STATE["openTrades"])
-        for t in list(STATE["openTrades"]): close_trade(t, p, "Close All")
-        return {"status": "success", "closed": count}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
+    p = last_price()
+    for t in list(STATE["openTrades"]): close_trade(t, p, "Close All")
+    return {"status": "success"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
